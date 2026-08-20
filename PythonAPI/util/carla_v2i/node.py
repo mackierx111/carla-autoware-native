@@ -6,6 +6,7 @@ scenario_simulator_v2 V2I traffic lights -- ss2 publishes the same topics
 itself (see README).
 """
 import argparse
+import sys
 import threading
 import time
 
@@ -100,11 +101,22 @@ class V2IPublisherNode(Node):
                 self.get_logger().warning(f"carla connect retry: {e}")
                 time.sleep(2.0)
         self._lights_by_way = {}
-        for actor in self._world.get_actors().filter("traffic.traffic_light*"):
-            way = actor.attributes.get("lanelet2_id")
-            if way:
-                kind = actor.attributes.get("signal_kind", "vehicle")
-                self._lights_by_way[int(way)] = (actor, kind)
+        deadline = time.time() + 60.0
+        while True:
+            for actor in self._world.get_actors().filter(
+                    "traffic.traffic_light*"):
+                way = actor.attributes.get("lanelet2_id")
+                if way:
+                    kind = actor.attributes.get("signal_kind", "vehicle")
+                    self._lights_by_way[int(way)] = (actor, kind)
+            if self._lights_by_way or time.time() >= deadline:
+                break
+            # A freshly connected client sees an empty actor list until the
+            # episode state reaches it (first frames after connect, and any
+            # time a synchronous-mode owner has not ticked yet); retry before
+            # concluding the map has no placed lights.
+            self.get_logger().info("v2i lights not visible yet; retrying")
+            time.sleep(1.0)
         self.get_logger().info(f"v2i lights={len(self._lights_by_way)}")
         self._ego_actor = None
 
@@ -265,8 +277,20 @@ def parse_args(argv=None):
 
 
 def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    # Pass anything from "--ros-args" onward to rclpy instead of argparse, so
+    # ROS parameters work, e.g. "--ros-args -p use_sim_time:=true" (required
+    # when the consuming stack runs on /clock: traffic_light_arbiter drops
+    # external messages whose stamp differs from its clock by more than
+    # external_delay_tolerance, so wall-clock stamps never ingest).
+    ros_argv = None
+    if "--ros-args" in argv:
+        split = argv.index("--ros-args")
+        ros_argv = argv[split:]
+        argv = argv[:split]
     args = parse_args(argv)
-    rclpy.init()
+    rclpy.init(args=ros_argv)
     node = None
     try:
         node = V2IPublisherNode(args)
