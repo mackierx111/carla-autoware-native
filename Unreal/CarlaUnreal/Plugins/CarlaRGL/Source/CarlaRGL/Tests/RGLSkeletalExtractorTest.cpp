@@ -80,7 +80,8 @@ bool FExtractAssetsTest::RunTest(const FString& Parameters)
             const FVector3f P = VB.VertexPosition(i);
             for (int k = 0; k < 3; ++k) MaxErrCm = FMath::Max(MaxErrCm, FMath::Abs(Data.Vertices[i].value[k] * 100.f - P[k]));
         }
-        TestTrue(FString::Printf(TEXT("vertex round-trip max err %f cm"), MaxErrCm), MaxErrCm < 1e-3f);
+        // spec §7 stage 1a(i): 1e-4 cm. float32 cm -> m -> cm is exact to well under that.
+        TestTrue(FString::Printf(TEXT("vertex round-trip max err %f cm"), MaxErrCm), MaxErrCm < 1e-4f);
 
         bool bIdxOk = true, bBoneOk = true, bSumOk = true;
         for (const rgl_vec3i& T : Data.Indices) for (int k = 0; k < 3; ++k) bIdxOk &= (T.value[k] >= 0 && T.value[k] < Data.Vertices.Num());

@@ -25,6 +25,10 @@ static UWorld* GetGameWorld()
         if (Ctx.WorldType == EWorldType::Game || Ctx.WorldType == EWorldType::PIE) return Ctx.World();
     return nullptr;
 }
+// Local copies (unity build: this file's own namespace) of the CVar helpers in
+// RGLSkeletalSceneManagerTest.cpp — a test must not leak CVar state to the next one.
+static void SetCVar(const TCHAR* Name, int32 V) { IConsoleManager::Get().FindConsoleVariable(Name)->Set(V, ECVF_SetByCode); }
+struct FCVarGuard { FString Name; int32 Old; FCVarGuard(const TCHAR* N) : Name(N), Old(IConsoleManager::Get().FindConsoleVariable(N)->GetInt()) {} ~FCVarGuard() { SetCVar(*Name, Old); } };
 
 // Ray grid from (0,-2000cm,kZ) looking +Y, covering the walker placed at (0,0,kZ). Returns hit points (RGL frame, m).
 static bool CastGrid(TArray<FVector>& OutHits, FString& Err)
@@ -48,13 +52,30 @@ static bool CastGrid(TArray<FVector>& OutHits, FString& Err)
         R.value[2][0] = 0.f; R.value[2][1] = 1.f; R.value[2][2] = 0.f;
     }
     rgl_node_t RaysN = nullptr, RtN = nullptr, CompactN = nullptr, YieldN = nullptr;
+    bool bRtLinked = false, bCompactLinked = false, bYieldLinked = false;
     const rgl_field_t Fields[] = { RGL_FIELD_XYZ_VEC3_F32 };
-    auto Fail = [&](const TCHAR* Api) { const char* E = nullptr; rgl_get_last_error_string(&E); Err = FString::Printf(TEXT("%s: %s"), Api, E ? *FString(UTF8_TO_TCHAR(E)) : TEXT("?")); if (RaysN) rgl_graph_destroy(RaysN); return false; };
+    // rgl_graph_destroy(RaysN) only frees the nodes reachable from RaysN, so a node that was
+    // created but not yet linked into that graph has to be destroyed on its own or it leaks.
+    auto Fail = [&](const TCHAR* Api)
+    {
+        const char* E = nullptr; rgl_get_last_error_string(&E);
+        Err = FString::Printf(TEXT("%s: %s"), Api, E ? *FString(UTF8_TO_TCHAR(E)) : TEXT("?"));
+        if (YieldN   && !bYieldLinked)   rgl_graph_destroy(YieldN);
+        if (CompactN && !bCompactLinked) rgl_graph_destroy(CompactN);
+        if (RtN      && !bRtLinked)      rgl_graph_destroy(RtN);
+        if (RaysN) rgl_graph_destroy(RaysN);
+        return false;
+    };
     if (rgl_node_rays_from_mat3x4f(&RaysN, Rays.GetData(), Rays.Num()) != RGL_SUCCESS) return Fail(TEXT("rays_from_mat3x4f"));
     if (rgl_node_raytrace(&RtN, nullptr) != RGL_SUCCESS) return Fail(TEXT("raytrace"));
     if (rgl_node_points_compact_by_field(&CompactN, RGL_FIELD_IS_HIT_I32) != RGL_SUCCESS) return Fail(TEXT("compact"));
     if (rgl_node_points_yield(&YieldN, Fields, 1) != RGL_SUCCESS) return Fail(TEXT("yield"));
-    if (rgl_graph_node_add_child(RaysN, RtN) != RGL_SUCCESS || rgl_graph_node_add_child(RtN, CompactN) != RGL_SUCCESS || rgl_graph_node_add_child(CompactN, YieldN) != RGL_SUCCESS) return Fail(TEXT("add_child"));
+    if (rgl_graph_node_add_child(RaysN, RtN) != RGL_SUCCESS) return Fail(TEXT("add_child(rays->raytrace)"));
+    bRtLinked = true;
+    if (rgl_graph_node_add_child(RtN, CompactN) != RGL_SUCCESS) return Fail(TEXT("add_child(raytrace->compact)"));
+    bCompactLinked = true;
+    if (rgl_graph_node_add_child(CompactN, YieldN) != RGL_SUCCESS) return Fail(TEXT("add_child(compact->yield)"));
+    bYieldLinked = true;
     if (rgl_graph_run(RaysN) != RGL_SUCCESS) return Fail(TEXT("graph_run"));
     int32_t Count = 0, Size = 0;
     if (rgl_graph_get_result_size(YieldN, RGL_FIELD_XYZ_VEC3_F32, &Count, &Size) != RGL_SUCCESS) return Fail(TEXT("get_result_size"));
@@ -71,7 +92,8 @@ bool FContainmentTest::RunTest(const FString& Parameters)
 {
     UWorld* World = GetGameWorld(); if (!TestNotNull(TEXT("game world"), World)) return false;
     USkeletalMesh* Mesh = LoadObject<USkeletalMesh>(nullptr, kWalkerSK); if (!TestNotNull(TEXT("walker SK"), Mesh)) return false;
-    IConsoleManager::Get().FindConsoleVariable(TEXT("rgl.SkeletalMesh.Enable"))->Set(1, ECVF_SetByCode);
+    FCVarGuard EnableGuard(TEXT("rgl.SkeletalMesh.Enable"));
+    SetCVar(TEXT("rgl.SkeletalMesh.Enable"), 1);
 
     APawn* P = World->SpawnActor<APawn>(APawn::StaticClass(), FTransform::Identity);
     USkeletalMeshComponent* Comp = NewObject<USkeletalMeshComponent>(P);
@@ -91,7 +113,12 @@ bool FContainmentTest::RunTest(const FString& Parameters)
         P->Destroy(); SM.UnregisterSensor(Sensor);
         return false;
     }
-    TArray<rgl_mat3x4f> Pose; RGLSkeletal::BuildWorldPose(Comp, Data.RawBoneNum, Pose);
+    TArray<rgl_mat3x4f> Pose;
+    if (!TestTrue(TEXT("BuildWorldPose"), RGLSkeletal::BuildWorldPose(Comp, Data.RawBoneNum, Pose)))
+    {
+        P->Destroy(); SM.UnregisterSensor(Sensor);
+        return false;   // Pose is untouched on failure; indexing it below would read garbage.
+    }
     FBox Box(ForceInit);
     for (int32 v = 0; v < Data.Vertices.Num(); ++v)
     {
