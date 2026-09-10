@@ -329,7 +329,12 @@ sent (`rgl_entity_set_pose_world`) and RGL skins on the GPU.
 | `rgl.SkeletalMesh.Enable` | 1 | 0 = legacy static-mesh-only behaviour (live: tears skeletal entities down). |
 | `rgl.SkeletalMesh.AlwaysTickPose` | 1 | Force `AlwaysTickPoseAndRefreshBones` + disable URO on registered components. Live. |
 | `rgl.SkeletalMesh.Scope` | 0 | 0 = pawn-owned only; 1 = all skeletal components. |
-| `rgl.SkeletalMesh.MaxEntities` | 256 | Budget; nearest-to-sensor wins. |
+| `rgl.SkeletalMesh.MaxEntities` | 64 | Budget; nearest-to-sensor wins (counts entities kept by unregistration hysteresis too). |
+| `rgl.SkeletalMesh.MinLOD` | 0 | Lowest LOD index the extractor may use; raise to trade fidelity for VRAM/skinning cost. |
+
+Device memory is roughly **24 B x vertices per registered skeletal entity** (RGL's
+SkeletonAnimator + GAS), e.g. ~8 MB for a 347k-vertex LOD0 vehicle; use `MaxEntities` and
+`MinLOD` to bound it.
 
 Set via the packaged `Config/DefaultEngine.ini` `[ConsoleVariables]` section (works in
 every build configuration, including Shipping), or, in Development/editor builds only,
@@ -340,10 +345,20 @@ every build configuration, including Shipping), or, in Development/editor builds
 > they only work in Development/editor. For a packaged Shipping server use the CVar in
 > `Config/DefaultEngine.ini`, or the dedicated Shipping-safe switches added on this
 > branch: `-rgl-skeletal-mesh-enable=<0|1>`, `-rgl-skeletal-mesh-always-tick-pose=<0|1>`,
-> `-rgl-skeletal-mesh-scope=<0|1>`, `-rgl-skeletal-mesh-max-entities=<n>`.
+> `-rgl-skeletal-mesh-scope=<0|1>`, `-rgl-skeletal-mesh-max-entities=<n>`,
+> `-rgl-skeletal-mesh-min-lod=<n>`.
 
-Known limits: no morph/cloth/deformer displacement; LOD-dependent bone evaluation may
-leave distal bones of far NPCs stale; discovery latency <= 1 s (scene sync period).
+Known limits:
+
+* No morph/cloth/deformer displacement; LOD-dependent bone evaluation may leave distal
+  bones of far NPCs stale; discovery latency <= 1 s (scene sync period).
+* **Ego self-visibility**: the ego vehicle's own skeletal body is registered too (before
+  this change only its door static meshes were). A roof-mounted lidar with a negative
+  `lower_fov` therefore returns roof/hood/trunk points at 0-2 m. Filter by range or by the
+  ego bounding box downstream if your consumer does not expect them.
+* **Kill-switch latency**: `rgl.SkeletalMesh.Enable 0` stops posing immediately, but the
+  existing entities are only removed at the next scene sync (<= 1 s).
+
 Tests: `Automation RunTests CarlaRGL.Skeletal` (editor -game),
 `PythonAPI/rgl/tests/check_dynamic_actor_visibility.py` (needs ROS2).
 
