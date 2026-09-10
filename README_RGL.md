@@ -316,3 +316,46 @@ prerequisites, validation indicators, return-mode mapping, and
 troubleshooting (including the HesaiPandarQT-specific
 `enable_hesai_udp_sequence` + `ensure_hesai_pandar_driver_compat`
 requirements).
+
+## Skeletal meshes (vehicle bodies, walkers)
+
+Since 2026-09 the RGL scene sync also registers pawn-owned `USkeletalMeshComponent`s
+(CARLA vehicles and walkers). Rest-pose vertices, 4-influence bone weights and inverse
+bind poses are uploaded once per (mesh, LOD); every tick only bone world matrices are
+sent (`rgl_entity_set_pose_world`) and RGL skins on the GPU.
+
+| CVar | Default | Effect |
+|---|---|---|
+| `rgl.SkeletalMesh.Enable` | 1 | 0 = legacy static-mesh-only behaviour (live: tears skeletal entities down). |
+| `rgl.SkeletalMesh.AlwaysTickPose` | 1 | Force `AlwaysTickPoseAndRefreshBones` + disable URO on registered components. Live. |
+| `rgl.SkeletalMesh.Scope` | 0 | 0 = pawn-owned only; 1 = all skeletal components. |
+| `rgl.SkeletalMesh.MaxEntities` | 256 | Budget; nearest-to-sensor wins. |
+
+Set via the packaged `Config/DefaultEngine.ini` `[ConsoleVariables]` section (works in
+every build configuration, including Shipping), or, in Development/editor builds only,
+`-ExecCmds="rgl.SkeletalMesh.Enable 0"`.
+
+> [!IMPORTANT]
+> `-ExecCmds=` and `-ini:` command-line overrides are compiled out of Shipping builds —
+> they only work in Development/editor. For a packaged Shipping server use the CVar in
+> `Config/DefaultEngine.ini`, or the dedicated Shipping-safe switches added on this
+> branch: `-rgl-skeletal-mesh-enable=<0|1>`, `-rgl-skeletal-mesh-always-tick-pose=<0|1>`,
+> `-rgl-skeletal-mesh-scope=<0|1>`, `-rgl-skeletal-mesh-max-entities=<n>`.
+
+Known limits: no morph/cloth/deformer displacement; LOD-dependent bone evaluation may
+leave distal bones of far NPCs stale; discovery latency <= 1 s (scene sync period).
+Tests: `Automation RunTests CarlaRGL.Skeletal` (editor -game),
+`PythonAPI/rgl/tests/check_dynamic_actor_visibility.py` (needs ROS2).
+
+Measured on the Shipping package (`check_dynamic_actor_visibility.py`, same binary,
+`rgl.SkeletalMesh.Enable=0` vs `=1`):
+
+| blueprint | OFF | ON |
+|---|---|---|
+| vehicle.ue4.audi.tt (Door=0) | 12 | 372 |
+| vehicle.ue4.ford.mustang (Door=0) | 6 | 367 |
+| vehicle.lincoln.mkz (doors) | 207 | 415 |
+| walker.pedestrian.0016 | 0 | 78 |
+
+Tick-cost impact (7 walkers + 3 vehicles + 1 RGL lidar, 20 Hz sync, world.tick() wall
+time): +11.4% median vs skeletal OFF (within the +20% budget).
