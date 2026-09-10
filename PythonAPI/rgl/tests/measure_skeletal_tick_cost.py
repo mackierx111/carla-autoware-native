@@ -25,10 +25,16 @@ def main():
         walkers = bp.filter("walker.pedestrian.*"); vehicles = bp.filter("vehicle.*")
         n_walkers = 0; n_vehicles = 0
         for i in range(a.walkers):
-            act = world.try_spawn_actor(walkers[i % len(walkers)], carla.Transform(carla.Location(10.0 + 2.0 * i, -3.0, gz + 0.2)))
+            x = 10.0 + 2.0 * i
+            act = world.try_spawn_actor(walkers[i % len(walkers)], carla.Transform(carla.Location(x, -3.0, gz + 1.0)))
+            if not act:
+                act = world.try_spawn_actor(walkers[i % len(walkers)], carla.Transform(carla.Location(x + 1.0, -3.0, gz + 1.0)))
             if act: actors.append(act); n_walkers += 1
         for i in range(a.vehicles):
-            act = world.try_spawn_actor(vehicles[i % len(vehicles)], carla.Transform(carla.Location(12.0 + 6.0 * i, 3.5, gz + 0.3)))
+            x = 12.0 + 8.0 * i
+            act = world.try_spawn_actor(vehicles[i % len(vehicles)], carla.Transform(carla.Location(x, 3.5, gz + 0.3)))
+            if not act:
+                act = world.try_spawn_actor(vehicles[i % len(vehicles)], carla.Transform(carla.Location(x, -6.0, gz + 0.3)))
             if act: actors.append(act); n_vehicles += 1
         print(f"spawned walkers={n_walkers}/{a.walkers} vehicles={n_vehicles}/{a.vehicles}", file=sys.stderr)
         for _ in range(a.warmup): world.tick()
@@ -36,7 +42,7 @@ def main():
         for _ in range(a.frames):
             t0 = time.perf_counter(); world.tick(); dts.append((time.perf_counter() - t0) * 1000.0)
         dts.sort()
-        print(json.dumps({"label": a.label, "actors": len(actors) - 1, "median_ms": statistics.median(dts), "p95_ms": dts[int(0.95 * len(dts)) - 1]}))
+        print(json.dumps({"label": a.label, "actors": len(actors) - 1, "walkers": n_walkers, "vehicles": n_vehicles, "median_ms": statistics.median(dts), "p95_ms": dts[int(0.95 * len(dts)) - 1]}))
     finally:
         for x in reversed(actors):
             try: x.destroy()
