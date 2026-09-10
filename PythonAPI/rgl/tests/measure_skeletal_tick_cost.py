@@ -7,9 +7,9 @@ import carla
 
 # Explicit blueprint ids so the scenario is identical across runs and machines
 # (bp.filter() order depends on the asset registry and is not stable).
-WALKER_IDS = ["walker.pedestrian.0001", "walker.pedestrian.0002", "walker.pedestrian.0003",
-              "walker.pedestrian.0004", "walker.pedestrian.0005", "walker.pedestrian.0006",
-              "walker.pedestrian.0007"]
+WALKER_IDS = ["walker.pedestrian.0015", "walker.pedestrian.0016", "walker.pedestrian.0017",
+              "walker.pedestrian.0018", "walker.pedestrian.0019", "walker.pedestrian.0020",
+              "walker.pedestrian.0021"]
 VEHICLE_IDS = ["vehicle.lincoln.mkz", "vehicle.ue4.audi.tt", "vehicle.mini.cooper"]
 
 
@@ -36,6 +36,11 @@ def main():
         for k, v in {"channels": 64, "range": 50, "points_per_second": 1300000, "rotation_frequency": 20, "sensor_tick": 0.05,
                      "rgl_lidar_topic_name": "/perf/rgl", "rgl_lidar_pointcloud_format": "PointXYZIRCAEDT"}.items():
             lidar.set_attribute(k, str(v))
+        missing = [bp_id for bp_id in WALKER_IDS + VEHICLE_IDS if find_bp(bp, bp_id) is None]
+        if missing:
+            for bp_id in missing:
+                print(f"ERROR: required blueprint not found: {bp_id}", file=sys.stderr)
+            sys.exit(2)
         actors.append(world.spawn_actor(lidar, carla.Transform(carla.Location(0, 0, 1.65))))
         gp = world.ground_projection(carla.Location(10.0, 0.0, 5.0), 20.0); gz = gp.location.z if gp is not None else 0.0
         walker_ids = []; vehicle_ids = []
