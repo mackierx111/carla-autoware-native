@@ -1,262 +1,157 @@
 #!/usr/bin/env python3
-"""GATE (spec 10-0 / 13-2): verify dynamic actors are visible to the RGL lidar.
+"""GATE (skeletal spec §7 stage 3): are dynamic actors visible to the RGL lidar?
 
-Spawns sensor.lidar.rgl, measures a BASELINE point count inside each (empty) target
-box, THEN spawns a vehicle and a walker 10 m in front (in separate, non-overlapping
-boxes) and re-measures. Requiring a point-count DELTA over the baseline avoids a false
-PASS from static geometry (ground/props) that already falls inside a box.
+Method (fixes the 2026-07 false positive, spec §0.4):
+  * FRESH samples only: a cloud is accepted iff it arrived after world.tick() AND its
+    header.stamp (RGL scene time) is strictly newer than the last accepted one.
+    Timeout => MEASUREMENT FAILURE (exit 2). Never silently reused.
+  * Equal sample counts; statistic = MEDIAN.
+  * NEGATIVE CONTROL first (fixed ROI, nothing spawned, two baselines must agree within
+    max(10 pts, 5 %)). Per-target: two baselines on the target's own ROI must agree too.
+  * Measurement starts >= one scene-sync period (1 s) + settle after each spawn/destroy.
+  * ROI = spawned actor's bounding box (XY +-0.3 m), Z in [ground+0.35, ground+2.15] m.
+    Sensor at world (0,0,1.65) yaw 0 => world == sensor frame + (0,0,1.65).
+  * delta = median(measured) - median(baseline).  PASS iff every REQUIRED target passes;
+    a missing/unspawnable required target is exit 2, not PASS.
 
-PASS  : vehicle box gains >= baseline + VEH_MIN_DELTA points AND
-        walker  box gains >= baseline + WALK_MIN_DELTA points.
-FAIL  : either delta is too small -> escalate per spec 13-2 (RadarTracks/classification
-        acceptance is blocked until the root cause is understood/fixed).
-
-IMPORTANT DEVIATION FROM THE ORIGINAL TASK BRIEF (empirically forced):
-    The brief assumed sensor.listen(callback) on the carla-native LidarMeasurement
-    pipeline (ARGLLidar::PostPhysTick -> SerializeAndSend when AreClientsListening())
-    would work like any other CARLA lidar. In this build, subscribing via
-    sensor.listen() and touching the resulting carla.LidarMeasurement (even just
-    reading len()/raw_data, never mind iterating .point.x) reliably SEGFAULTS the
-    Python client on the very first message -- reproduced with channels=1..64,
-    points_per_second=100..1,300,000, with and without iterating. No listen() ->
-    no crash (AreClientsListening() short-circuits and nothing is sent), so this is a
-    real client-side deserialization bug in the ARGLLidar -> LidarData -> Python
-    LidarMeasurement path, independent of this test.
-    Workaround used here: publish via the sensor's built-in ROS2 PointCloud2 output
-    (rgl_lidar_topic_name / PointXYZIRCAEDT format) and subscribe with rclpy, exactly
-    like PythonAPI/rgl/tests/test_regression.py's capture_ros2_msg()/parse_points().
-    This requires ROS2 to be sourced (e.g. `source /opt/ros/humble/setup.bash`) before
-    running this script, even though the original brief said "ROS2 not required".
-
+Requires ROS2 sourced (rclpy, sensor_msgs): sensor.listen() segfaults for sensor.lidar.rgl.
 Usage:
-    # CARLA server must be running (RGL build). Source ROS2 first:
-    #   source /opt/ros/humble/setup.bash
-    python3 check_dynamic_actor_visibility.py [--host 127.0.0.1] [--port 2000]
+    source /opt/ros/humble/setup.bash
+    python3 check_dynamic_actor_visibility.py [--host H] [--port P] [--label NAME]
+        [--targets vehicle.ue4.audi.tt,vehicle.ue4.ford.mustang,vehicle.lincoln.mkz,walker.pedestrian.0016]
+        [--veh-min 200] [--walk-min 40] [--ticks 30] [--json]
 """
-
-import argparse
-import struct
-import sys
-import time
-
+import argparse, json, math, struct, sys, time
 import carla
-
 try:
     import rclpy
     from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
     from sensor_msgs.msg import PointCloud2
 except ImportError:
-    print(
-        "ERROR: rclpy / sensor_msgs not importable. This gate script needs ROS2 "
-        "sourced (e.g. `source /opt/ros/humble/setup.bash`) because the RGL lidar's "
-        "carla-native sensor.listen() path segfaults the Python client in this build "
-        "-- see the module docstring. Falling back to ROS2 PointCloud2 instead.",
-        file=sys.stderr,
-    )
-    sys.exit(2)
+    print("ERROR: rclpy/sensor_msgs not importable; source ROS2 first.", file=sys.stderr); sys.exit(2)
 
-VEH_MIN_DELTA = 50       # vehicle box must gain >= baseline + this many points
-WALK_MIN_DELTA = 20      # walker box must gain >= baseline + this many points
-FRONT_DIST_M = 10.0      # target distance in front of the sensor (meters)
-BOX_HALF_X = 3.0         # sensor-local X (forward) half-extent of the count box (m)
-BOX_HALF_Y = 1.5         # sensor-local Y half-extent (m); keeps the two boxes disjoint
-VEH_Y = 3.0              # vehicle box center in Y -> box covers [1.5, 4.5]
-WALK_Y = -3.0            # walker box center in Y  -> box covers [-4.5, -1.5] (disjoint)
-Z_MIN, Z_MAX = -2.0, 3.0  # sensor-local Z window (m)
-BASELINE_TICKS = 15      # ticks to measure the empty-scene baseline before spawning targets
-TICKS = 30               # ticks to measure after spawning targets
-SETTLE_TICKS = 5         # extra (uncounted) ticks after spawn, for physics/pose to settle
-
-ROS2_TOPIC = "/gate/rgl_dynamic_actor_visibility"
-TICK_WAIT_TIMEOUT_S = 2.0
+DEFAULT_TARGETS = "vehicle.ue4.audi.tt,vehicle.ue4.ford.mustang,vehicle.lincoln.mkz,walker.pedestrian.0016"
+SENSOR_Z, FRONT_M, ROI_XY_MARGIN, Z_LO, Z_HI = 1.65, 10.0, 0.3, 0.35, 2.15
+SYNC_PERIOD_TICKS, SETTLE_TICKS = 20, 5
+ROS2_TOPIC, TICK_WAIT_TIMEOUT_S = "/gate/rgl_dynamic_actor_visibility", 2.0
+CHANNELS, PPS, ROT_HZ, UPPER, LOWER = 64, 1_300_000, 20, 15.0, -25.0
 
 
-def count_in_box(points, x_center, y_center):
-    """points: iterable of (x, y, z) sensor-local meters."""
-    n = 0
-    for (x, y, z) in points:
-        if (abs(x - x_center) <= BOX_HALF_X and abs(y - y_center) <= BOX_HALF_Y
-                and Z_MIN <= z <= Z_MAX):
-            n += 1
-    return n
+class MeasurementError(RuntimeError):
+    pass
 
 
+def stamp_s(msg): return msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+def median(v):
+    s = sorted(v); n = len(s)
+    return 0 if n == 0 else (s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2]))
 def parse_xyz(msg):
-    """Parse the leading x,y,z float32 triplet out of each PointXYZIRCAEDT record."""
-    pts = []
-    off = 0
-    step = msg.point_step
+    pts, off = [], 0
     for _ in range(msg.width):
-        x, y, z = struct.unpack_from("<fff", msg.data, off)
-        pts.append((x, y, z))
-        off += step
+        x, y, z = struct.unpack_from("<fff", msg.data, off); pts.append((x, y, z + SENSOR_Z)); off += msg.point_step
     return pts
+def count_in_roi(points, roi):
+    x0, x1, y0, y1, z0, z1 = roi
+    return sum(1 for (x, y, z) in points if x0 <= x <= x1 and y0 <= y <= y1 and z0 <= z <= z1)
+def silhouette_rays(extent_y_m, height_m, dist_m):
+    h_res = 360.0 / ((PPS / ROT_HZ) / CHANNELS); v_res = (UPPER - LOWER) / (CHANNELS - 1)
+    w = math.degrees(2 * math.atan(extent_y_m / dist_m)); h = math.degrees(2 * math.atan(0.5 * height_m / dist_m))
+    return int((w / h_res) * (h / v_res))
+def stable(a, b): return abs(b - a) <= max(10, 0.05 * a)
+
+
+class Gate:
+    def __init__(self, world, node, ticks):
+        self.world, self.node, self.ticks = world, node, ticks
+        self.latest, self.last_stamp = {"msg": None, "seq": 0}, -1.0
+        qos = QoSProfile(depth=10); qos.reliability = ReliabilityPolicy.BEST_EFFORT; qos.durability = DurabilityPolicy.VOLATILE
+        node.create_subscription(PointCloud2, ROS2_TOPIC, self._on_msg, qos)
+    def _on_msg(self, msg): self.latest = {"msg": msg, "seq": self.latest["seq"] + 1}
+    def tick_fresh(self):
+        seq0 = self.latest["seq"]; self.world.tick(); t0 = time.time()
+        while time.time() - t0 < TICK_WAIT_TIMEOUT_S:
+            rclpy.spin_once(self.node, timeout_sec=0.02)
+            if self.latest["seq"] != seq0:
+                msg = self.latest["msg"]; st = stamp_s(msg)
+                if st > self.last_stamp: self.last_stamp = st; return msg
+                seq0 = self.latest["seq"]
+        raise MeasurementError("timeout waiting for a fresh point cloud")
+    def skip(self, n):
+        for _ in range(n): self.tick_fresh()
+    def measure(self, roi): return median([count_in_roi(parse_xyz(self.tick_fresh()), roi) for _ in range(self.ticks)])
+
+
+def roi_for(actor, ground_z):
+    verts = actor.bounding_box.get_world_vertices(actor.get_transform())
+    xs, ys = [v.x for v in verts], [v.y for v in verts]
+    return (min(xs) - ROI_XY_MARGIN, max(xs) + ROI_XY_MARGIN, min(ys) - ROI_XY_MARGIN, max(ys) + ROI_XY_MARGIN, ground_z + Z_LO, ground_z + Z_HI), actor.bounding_box
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=2000)
+    ap.add_argument("--host", default="127.0.0.1"); ap.add_argument("--port", type=int, default=2000)
+    ap.add_argument("--label", default=""); ap.add_argument("--targets", default=DEFAULT_TARGETS)
+    ap.add_argument("--veh-min", type=int, default=200); ap.add_argument("--walk-min", type=int, default=40)
+    ap.add_argument("--ticks", type=int, default=30); ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
+    targets = [t.strip() for t in args.targets.split(",") if t.strip()]
+    if args.ticks < 5 or not targets or args.veh_min < 0 or args.walk_min < 0:
+        print("ERROR: invalid arguments (ticks>=5, non-empty targets, non-negative thresholds)", file=sys.stderr); return 2
 
-    client = carla.Client(args.host, args.port)
-    client.set_timeout(20.0)
-    world = client.get_world()
-
-    original = world.get_settings()
-    settings = world.get_settings()
-    settings.synchronous_mode = True
-    settings.fixed_delta_seconds = 0.05
-    world.apply_settings(settings)
-
-    rclpy.init()
-    node = rclpy.create_node("rgl_dynamic_actor_visibility_gate")
-    latest = {"msg": None, "count": 0}
-
-    def on_pointcloud(msg):
-        latest["msg"] = msg
-        latest["count"] += 1
-
-    qos = QoSProfile(depth=10)
-    qos.reliability = ReliabilityPolicy.BEST_EFFORT
-    qos.durability = DurabilityPolicy.VOLATILE
-    node.create_subscription(PointCloud2, ROS2_TOPIC, on_pointcloud, qos)
-
-    actors = []
-
-    def tick_and_wait():
-        """world.tick() then block (bounded) for the NEW lidar message for this tick.
-
-        This is the ROS2-pathway equivalent of "match sensor callback frame to world
-        snapshot frame" -- we can't correlate a CARLA frame number through ROS2
-        directly, so we instead require a freshly-arrived message (msg counter
-        incremented) before counting, which prevents racing a stale/previous-tick
-        point cloud since sensor_tick == fixed_delta_seconds (one sweep per tick).
-        """
-        prev = latest["count"]
-        frame = world.tick()
-        t0 = time.time()
-        while latest["count"] == prev and (time.time() - t0) < TICK_WAIT_TIMEOUT_S:
-            rclpy.spin_once(node, timeout_sec=0.02)
-        return frame, latest["msg"]
-
-    def measure(n_ticks):
-        veh_max = 0
-        walk_max = 0
-        got_any = False
-        for _ in range(n_ticks):
-            _, msg = tick_and_wait()
-            if msg is None:
-                continue
-            got_any = True
-            pts = parse_xyz(msg)
-            veh_max = max(veh_max, count_in_box(pts, FRONT_DIST_M, VEH_Y))
-            walk_max = max(walk_max, count_in_box(pts, FRONT_DIST_M, WALK_Y))
-        return veh_max, walk_max, got_any
-
+    client = carla.Client(args.host, args.port); client.set_timeout(20.0); world = client.get_world()
+    original = world.get_settings(); node = None; actors = []; results = []; rc = 0
     try:
-        bp_lib = world.get_blueprint_library()
+        s = world.get_settings(); s.synchronous_mode = True; s.fixed_delta_seconds = 1.0 / ROT_HZ; world.apply_settings(s)
+        rclpy.init(); node = rclpy.create_node("rgl_dynamic_actor_visibility_gate"); gate = Gate(world, node, args.ticks)
+        bp = world.get_blueprint_library(); lidar_bp = bp.find("sensor.lidar.rgl")
+        for k, v in {"channels": CHANNELS, "range": 50, "upper_fov": UPPER, "lower_fov": LOWER, "points_per_second": PPS,
+                     "rotation_frequency": ROT_HZ, "sensor_tick": 1.0 / ROT_HZ, "rgl_lidar_topic_name": ROS2_TOPIC,
+                     "rgl_lidar_topic_frame_id": "lidar", "rgl_lidar_pointcloud_format": "PointXYZIRCAEDT"}.items():
+            lidar_bp.set_attribute(k, str(v))
+        actors.append(world.spawn_actor(lidar_bp, carla.Transform(carla.Location(0.0, 0.0, SENSOR_Z))))
+        gate.skip(SYNC_PERIOD_TICKS + SETTLE_TICKS)
+        gp = world.ground_projection(carla.Location(FRONT_M, 0.0, 5.0), 20.0); ground_z = gp.location.z if gp is not None else 0.0
+        spawn_tf = carla.Transform(carla.Location(FRONT_M, 0.0, ground_z + 0.3))
 
-        # Sensor on a pole at the origin, facing +X (default rotation). World coords
-        # == sensor-local coords here since there is no parent actor and rotation is
-        # identity, matching the box definitions above.
-        lidar_bp = bp_lib.find("sensor.lidar.rgl")
-        lidar_bp.set_attribute("channels", "64")
-        lidar_bp.set_attribute("range", "50")
-        lidar_bp.set_attribute("upper_fov", "15")
-        lidar_bp.set_attribute("lower_fov", "-25")
-        lidar_bp.set_attribute("points_per_second", "1300000")
-        # Match rotation_frequency to the tick rate (1 / fixed_delta_seconds) so each
-        # published point cloud is one complete, consistent 360-degree sweep per tick
-        # instead of a partial arc -- verified empirically to make box counts stable
-        # tick-to-tick for a static scene.
-        lidar_bp.set_attribute("rotation_frequency", "20")
-        lidar_bp.set_attribute("sensor_tick", "0.05")
-        lidar_bp.set_attribute("rgl_lidar_topic_name", ROS2_TOPIC)
-        lidar_bp.set_attribute("rgl_lidar_topic_frame_id", "lidar")
-        lidar_bp.set_attribute("rgl_lidar_pointcloud_format", "PointXYZIRCAEDT")
-        sensor_tf = carla.Transform(carla.Location(x=0.0, y=0.0, z=1.65))
-        sensor = world.spawn_actor(lidar_bp, sensor_tf)
-        actors.append(sensor)
+        nc_roi = (FRONT_M - 3.0, FRONT_M + 3.0, -1.5, 1.5, ground_z + Z_LO, ground_z + Z_HI)
+        b1, b2 = gate.measure(nc_roi), gate.measure(nc_roi)
+        print(f"[{args.label}] negative control: b1={b1} b2={b2} -> {'OK' if stable(b1, b2) else 'UNSTABLE'}")
+        if not stable(b1, b2): raise MeasurementError("fixture unstable with nothing spawned")
 
-        # Warm-up: let the ROS2 pub/sub match and the first sweeps settle.
-        for _ in range(5):
-            tick_and_wait()
-
-        # ---- Baseline: measure each box BEFORE spawning targets (static geometry only).
-        veh_baseline, walk_baseline, base_ok = measure(BASELINE_TICKS)
-        if not base_ok:
-            print("ERROR: RGL lidar produced ZERO point-cloud messages during the "
-                  "baseline phase. This is a sensor/pipeline problem, not a dynamic-"
-                  "actor visibility result -- investigate sensor attachment, "
-                  "AreClientsListening()/ROS2 topic wiring, range, and world ticking "
-                  "before concluding anything about vehicles/walkers.", file=sys.stderr)
-            return 2
-
-        # Vehicle 10 m in front, in the +Y box; grounded via world.ground_projection.
-        veh_bp = bp_lib.filter("vehicle.*")[0]
-        walk_bp = bp_lib.filter("walker.pedestrian.*")[0]
-        veh_gp = world.ground_projection(carla.Location(FRONT_DIST_M, VEH_Y, 5.0), 20.0)
-        walk_gp = world.ground_projection(carla.Location(FRONT_DIST_M, WALK_Y, 5.0), 20.0)
-        veh_ground_z = veh_gp.location.z if veh_gp is not None else 0.0
-        walk_ground_z = walk_gp.location.z if walk_gp is not None else 0.0
-
-        veh = world.spawn_actor(
-            veh_bp, carla.Transform(carla.Location(x=FRONT_DIST_M, y=VEH_Y, z=veh_ground_z + 0.3)))
-        actors.append(veh)
-
-        # Walker 10 m in front, in the -Y box (non-overlapping with the vehicle box).
-        walk = world.spawn_actor(
-            walk_bp, carla.Transform(carla.Location(x=FRONT_DIST_M, y=WALK_Y, z=walk_ground_z + 0.2)))
-        actors.append(walk)
-
-        for _ in range(SETTLE_TICKS):
-            tick_and_wait()
-
-        veh_hits_max, walk_hits_max, meas_ok = measure(TICKS)
-        if not meas_ok:
-            print("ERROR: RGL lidar produced ZERO point-cloud messages after spawning "
-                  "the targets (but produced points during baseline). Investigate "
-                  "sensor/topic stability.", file=sys.stderr)
-            return 2
-
-        veh_need = veh_baseline + VEH_MIN_DELTA
-        walk_need = walk_baseline + WALK_MIN_DELTA
-        print(f"vehicle box: baseline={veh_baseline}, measured={veh_hits_max}, "
-              f"need>={veh_need} (baseline+{VEH_MIN_DELTA})")
-        print(f"walker  box: baseline={walk_baseline}, measured={walk_hits_max}, "
-              f"need>={walk_need} (baseline+{WALK_MIN_DELTA})")
-
-        veh_ok = veh_hits_max >= veh_need
-        walk_ok = walk_hits_max >= walk_need
-        print(f"vehicle target: {'PASS' if veh_ok else 'FAIL'}")
-        print(f"walker  target: {'PASS' if walk_ok else 'FAIL'}")
-
-        if veh_ok and walk_ok:
-            print("GATE RESULT: PASS - dynamic actors add points over baseline (visible to the RGL lidar).")
-            return 0
-
-        print("GATE RESULT: FAIL - dynamic actor(s) did NOT add enough points over baseline.")
-        print("  -> STOP. Escalate per spec 13-2 before RadarTracks/classification acceptance.")
-        return 1
+        for bp_id in targets:
+            try: target_bp = bp.find(bp_id)
+            except Exception: raise MeasurementError(f"required blueprint not found: {bp_id}")
+            is_walker = bp_id.startswith("walker.")
+            probe = world.spawn_actor(target_bp, spawn_tf)
+            if probe is None: raise MeasurementError(f"spawn failed: {bp_id}")
+            actors.append(probe); gate.skip(SETTLE_TICKS); roi, bb = roi_for(probe, ground_z)
+            probe.destroy(); actors.remove(probe); gate.skip(SYNC_PERIOD_TICKS + SETTLE_TICKS)
+            base1, base2 = gate.measure(roi), gate.measure(roi)
+            if not stable(base1, base2): raise MeasurementError(f"baseline unstable for {bp_id}: {base1} vs {base2}")
+            base = median([base1, base2])
+            actor = world.spawn_actor(target_bp, spawn_tf)
+            if actor is None: raise MeasurementError(f"spawn failed: {bp_id}")
+            actors.append(actor); gate.skip(SYNC_PERIOD_TICKS + SETTLE_TICKS)
+            meas = gate.measure(roi)
+            actor.destroy(); actors.remove(actor); gate.skip(SYNC_PERIOD_TICKS + SETTLE_TICKS)
+            delta = meas - base; theo = silhouette_rays(bb.extent.y, 2 * bb.extent.z, FRONT_M)
+            need = args.walk_min if is_walker else args.veh_min; ok = delta >= need; rc = rc or (0 if ok else 1)
+            print(f"[{args.label}] {bp_id:34s} base={base:7.1f} meas={meas:7.1f} delta={delta:7.1f} need>={need:4d} silhouette~{theo:5d} (30%={int(0.3*theo):4d}) -> {'PASS' if ok else 'FAIL'}")
+            results.append({"id": bp_id, "status": "pass" if ok else "fail", "baseline": base, "measured": meas, "delta": delta, "need": need, "silhouette": theo})
+        if len(results) != len(targets): raise MeasurementError("not every required target was measured")
+        print(f"[{args.label}] GATE RESULT: {'PASS' if rc == 0 else 'FAIL'}")
+        if args.json: print(json.dumps({"label": args.label, "negative_control": {"b1": b1, "b2": b2}, "results": results}))
+        return rc
+    except MeasurementError as e:
+        print(f"[{args.label}] ERROR (measurement failure): {e}", file=sys.stderr); return 2
     finally:
         for a in reversed(actors):
+            try: a.destroy()
+            except Exception: pass
+        for fn in ((node.destroy_node if node else None), rclpy.shutdown, lambda: world.apply_settings(original)):
             try:
-                a.destroy()
-            except Exception:
-                pass
-        try:
-            node.destroy_node()
-        except Exception:
-            pass
-        try:
-            rclpy.shutdown()
-        except Exception:
-            pass
-        try:
-            world.apply_settings(original)
-        except Exception:
-            pass
+                if fn: fn()
+            except Exception: pass
 
 
 if __name__ == "__main__":
