@@ -5,6 +5,22 @@ Usage: python3 measure_skeletal_tick_cost.py --label C [--walkers 7 --vehicles 3
 import argparse, json, statistics, sys, time
 import carla
 
+# Explicit blueprint ids so the scenario is identical across runs and machines
+# (bp.filter() order depends on the asset registry and is not stable).
+WALKER_IDS = ["walker.pedestrian.0001", "walker.pedestrian.0002", "walker.pedestrian.0003",
+              "walker.pedestrian.0004", "walker.pedestrian.0005", "walker.pedestrian.0006",
+              "walker.pedestrian.0007"]
+VEHICLE_IDS = ["vehicle.lincoln.mkz", "vehicle.ue4.audi.tt", "vehicle.mini.cooper"]
+
+
+def find_bp(bp_lib, bp_id):
+    try:
+        return bp_lib.find(bp_id)
+    except Exception as e:
+        print(f"blueprint not found: {bp_id} ({e})", file=sys.stderr)
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1"); ap.add_argument("--port", type=int, default=2000)
@@ -21,28 +37,36 @@ def main():
                      "rgl_lidar_topic_name": "/perf/rgl", "rgl_lidar_pointcloud_format": "PointXYZIRCAEDT"}.items():
             lidar.set_attribute(k, str(v))
         actors.append(world.spawn_actor(lidar, carla.Transform(carla.Location(0, 0, 1.65))))
-        gp = world.ground_projection(carla.Location(10.0, 0.0, 5.0), 20.0); gz = gp.location.z if gp else 0.0
-        walkers = bp.filter("walker.pedestrian.*"); vehicles = bp.filter("vehicle.*")
-        n_walkers = 0; n_vehicles = 0
+        gp = world.ground_projection(carla.Location(10.0, 0.0, 5.0), 20.0); gz = gp.location.z if gp is not None else 0.0
+        walker_ids = []; vehicle_ids = []
         for i in range(a.walkers):
+            bp_id = WALKER_IDS[i % len(WALKER_IDS)]
+            wbp = find_bp(bp, bp_id)
+            if wbp is None: continue
             x = 10.0 + 2.0 * i
-            act = world.try_spawn_actor(walkers[i % len(walkers)], carla.Transform(carla.Location(x, -3.0, gz + 1.0)))
+            act = world.try_spawn_actor(wbp, carla.Transform(carla.Location(x, -3.0, gz + 1.0)))
             if not act:
-                act = world.try_spawn_actor(walkers[i % len(walkers)], carla.Transform(carla.Location(x + 1.0, -3.0, gz + 1.0)))
-            if act: actors.append(act); n_walkers += 1
+                act = world.try_spawn_actor(wbp, carla.Transform(carla.Location(x + 1.0, -3.0, gz + 1.0)))
+            if act: actors.append(act); walker_ids.append(bp_id)
         for i in range(a.vehicles):
+            bp_id = VEHICLE_IDS[i % len(VEHICLE_IDS)]
+            vbp = find_bp(bp, bp_id)
+            if vbp is None: continue
             x = 12.0 + 8.0 * i
-            act = world.try_spawn_actor(vehicles[i % len(vehicles)], carla.Transform(carla.Location(x, 3.5, gz + 0.3)))
+            act = world.try_spawn_actor(vbp, carla.Transform(carla.Location(x, 3.5, gz + 0.3)))
             if not act:
-                act = world.try_spawn_actor(vehicles[i % len(vehicles)], carla.Transform(carla.Location(x, -6.0, gz + 0.3)))
-            if act: actors.append(act); n_vehicles += 1
+                act = world.try_spawn_actor(vbp, carla.Transform(carla.Location(x, -6.0, gz + 0.3)))
+            if act: actors.append(act); vehicle_ids.append(bp_id)
+        n_walkers = len(walker_ids); n_vehicles = len(vehicle_ids)
         print(f"spawned walkers={n_walkers}/{a.walkers} vehicles={n_vehicles}/{a.vehicles}", file=sys.stderr)
         for _ in range(a.warmup): world.tick()
         dts = []
         for _ in range(a.frames):
             t0 = time.perf_counter(); world.tick(); dts.append((time.perf_counter() - t0) * 1000.0)
         dts.sort()
-        print(json.dumps({"label": a.label, "actors": len(actors) - 1, "walkers": n_walkers, "vehicles": n_vehicles, "median_ms": statistics.median(dts), "p95_ms": dts[int(0.95 * len(dts)) - 1]}))
+        print(json.dumps({"label": a.label, "actors": len(actors) - 1, "walkers": n_walkers, "vehicles": n_vehicles,
+                          "walker_ids": walker_ids, "vehicle_ids": vehicle_ids,
+                          "median_ms": statistics.median(dts), "p95_ms": dts[int(0.95 * len(dts)) - 1]}))
     finally:
         for x in reversed(actors):
             try: x.destroy()

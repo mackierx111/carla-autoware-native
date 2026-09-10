@@ -2,8 +2,10 @@
 """GATE (skeletal spec §7 stage 3): are dynamic actors visible to the RGL lidar?
 
 Method (fixes the 2026-07 false positive, spec §0.4):
-  * FRESH samples only: a cloud is accepted iff it arrived after world.tick() AND its
-    header.stamp (RGL scene time) is strictly newer than the last accepted one.
+  * FRESH samples only: a cloud is accepted iff it arrived after world.tick(), its
+    header.stamp (RGL scene time) is strictly newer than the last accepted one, AND it
+    matches the current tick's sim time to within half a step (a queued older sweep is
+    also "newer", so recency alone is not enough).
     Timeout => MEASUREMENT FAILURE (exit 2). Never silently reused.
   * Equal sample counts; statistic = MEDIAN.
   * NEGATIVE CONTROL first (fixed ROI, nothing spawned, two baselines must agree within
@@ -22,7 +24,10 @@ Usage:
         [--veh-min 200] [--walk-min 40] [--ticks 30] [--json]
 """
 import argparse, json, math, struct, sys, time
-import carla
+try:
+    import carla
+except ImportError as e:
+    print(f"ERROR: cannot import carla ({e}); check PYTHONPATH.", file=sys.stderr); sys.exit(2)
 try:
     import rclpy
     from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -35,6 +40,7 @@ SENSOR_Z, FRONT_M, ROI_XY_MARGIN, Z_LO, Z_HI = 1.65, 10.0, 0.3, 0.35, 2.15
 SYNC_PERIOD_TICKS, SETTLE_TICKS = 20, 5
 ROS2_TOPIC, TICK_WAIT_TIMEOUT_S = "/gate/rgl_dynamic_actor_visibility", 2.0
 CHANNELS, PPS, ROT_HZ, UPPER, LOWER = 64, 1_300_000, 20, 15.0, -25.0
+FIXED_DELTA = 1.0 / ROT_HZ          # synchronous-mode step; one sweep per tick
 
 
 class MeasurementError(RuntimeError):
@@ -67,27 +73,43 @@ class Gate:
         qos = QoSProfile(depth=10); qos.reliability = ReliabilityPolicy.BEST_EFFORT; qos.durability = DurabilityPolicy.VOLATILE
         node.create_subscription(PointCloud2, ROS2_TOPIC, self._on_msg, qos)
     def _on_msg(self, msg): self.latest = {"msg": msg, "seq": self.latest["seq"] + 1}
+    def sim_time(self):
+        """Scene time of the tick that just completed. RGL stamps its ROS2 header with the
+        CARLA SimulationTime it was given, so this is directly comparable to stamp_s(msg)."""
+        return self.world.get_snapshot().timestamp.elapsed_seconds
     def warmup(self, max_ticks=400):
         """Tick until the first cloud arrives (ROS2 discovery + first sweep).
         Synchronous mode only advances on tick, so keep ticking while spinning.
-        Raises MeasurementError if no cloud arrives within max_ticks."""
+        Also verifies the stamp convention: tick-matched freshness is only meaningful if
+        header.stamp tracks sim time. Raises MeasurementError if no cloud arrives within
+        max_ticks, or if the first stamp is nowhere near the sim clock."""
         for i in range(max_ticks):
             self.world.tick()
+            t_sim = self.sim_time()
             rclpy.spin_once(self.node, timeout_sec=0.02)
             if self.latest["msg"] is not None:
                 self.last_stamp = stamp_s(self.latest["msg"])
-                print(f"warm-up: first cloud after {i + 1} ticks (stamp {self.last_stamp:.3f})")
+                print(f"warm-up: first cloud after {i + 1} ticks (stamp {self.last_stamp:.3f} sim {t_sim:.3f})")
+                if abs(self.last_stamp - t_sim) > 2.0:
+                    raise MeasurementError(
+                        f"cloud stamp {self.last_stamp:.3f} does not track sim time {t_sim:.3f}; "
+                        f"cannot do tick-matched freshness")
                 return
         raise MeasurementError(f"no point cloud after {max_ticks} warm-up ticks")
     def tick_fresh(self):
-        seq0 = self.latest["seq"]; self.world.tick(); t0 = time.time()
+        """Tick once and return the cloud belonging to THAT tick. A message that is merely
+        newer than the last accepted one may still be a queued older sweep, so it must also
+        match the current scene time to within half a step."""
+        seq0 = self.latest["seq"]; self.world.tick(); t_sim = self.sim_time(); t0 = time.time()
         while time.time() - t0 < TICK_WAIT_TIMEOUT_S:
             rclpy.spin_once(self.node, timeout_sec=0.02)
             if self.latest["seq"] != seq0:
-                msg = self.latest["msg"]; st = stamp_s(msg)
-                if st > self.last_stamp: self.last_stamp = st; return msg
                 seq0 = self.latest["seq"]
-        raise MeasurementError("timeout waiting for a fresh point cloud")
+                msg = self.latest["msg"]; st = stamp_s(msg)
+                if st > self.last_stamp and abs(st - t_sim) <= 0.5 * FIXED_DELTA:
+                    self.last_stamp = st; return msg
+        raise MeasurementError(
+            f"timeout waiting for the cloud of sim time {t_sim:.3f} (last accepted stamp {self.last_stamp:.3f})")
     def skip(self, n):
         for _ in range(n): self.tick_fresh()
     def measure(self, roi): return median([count_in_roi(parse_xyz(self.tick_fresh()), roi) for _ in range(self.ticks)])
@@ -110,8 +132,9 @@ def main():
     if args.ticks < 5 or not targets or args.veh_min < 0 or args.walk_min < 0:
         print("ERROR: invalid arguments (ticks>=5, non-empty targets, non-negative thresholds)", file=sys.stderr); return 2
 
-    client = carla.Client(args.host, args.port); client.set_timeout(20.0); world = client.get_world()
-    original = world.get_settings(); node = None; actors = []; results = []; rc = 0
+    # Everything that can fail on a dead/absent server lives inside the try below, so a
+    # connection failure is reported as a measurement failure (exit 2), not a traceback.
+    world = None; original = None; node = None; actors = []; results = []; rc = 0
 
     def spawn_or_fail(bp_obj, tf, what):
         try:
@@ -123,7 +146,9 @@ def main():
         return a
 
     try:
-        s = world.get_settings(); s.synchronous_mode = True; s.fixed_delta_seconds = 1.0 / ROT_HZ; world.apply_settings(s)
+        client = carla.Client(args.host, args.port); client.set_timeout(20.0); world = client.get_world()
+        original = world.get_settings()
+        s = world.get_settings(); s.synchronous_mode = True; s.fixed_delta_seconds = FIXED_DELTA; world.apply_settings(s)
         rclpy.init(); node = rclpy.create_node("rgl_dynamic_actor_visibility_gate"); gate = Gate(world, node, args.ticks)
         bp = world.get_blueprint_library()
         try: lidar_bp = bp.find("sensor.lidar.rgl")
@@ -175,7 +200,8 @@ def main():
         for a in reversed(actors):
             try: a.destroy()
             except Exception: pass
-        for fn in ((node.destroy_node if node else None), rclpy.shutdown, lambda: world.apply_settings(original)):
+        restore = (lambda: world.apply_settings(original)) if (world is not None and original is not None) else None
+        for fn in ((node.destroy_node if node else None), rclpy.shutdown, restore):
             try:
                 if fn: fn()
             except Exception: pass
