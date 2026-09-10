@@ -18,6 +18,8 @@
 #include "Components/SkeletalMeshComponent.h"
 #include "GameFramework/Pawn.h"
 #include "HAL/IConsoleManager.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
 #include "Rendering/PositionVertexBuffer.h"
 #include "StaticMeshResources.h"
 #include "PhysicsEngine/BodySetup.h"
@@ -60,10 +62,46 @@ static TAutoConsoleVariable<int32> CVarRGLSkeletalDebugForcePoseFailure(TEXT("rg
     TEXT("Test only: make every skeletal pose build fail (exercises destroy->pending->recover)."), ECVF_Default);
 #endif
 
+// Shipping-safe rebuild-free kill switch (spec §6.4). A packaged Shipping server cannot
+// take `-ExecCmds=` (UnrealEngine.cpp: #if !UE_BUILD_SHIPPING) nor `-ini:` overrides
+// (ALLOW_INI_OVERRIDE_FROM_COMMANDLINE = UE_SERVER || !UE_BUILD_SHIPPING), so the CVars
+// above would be unreachable from the command line. FParse::Value is compiled in for every
+// configuration, so these switches work everywhere; they only *set* the CVars, which remain
+// the single source of truth. ECVF_SetByCommandline ranks below ECVF_SetByCode, so console
+// commands and the Automation tests can still override them at runtime.
+static void ApplySkeletalCommandLineOverrides()
+{
+    static bool bApplied = false; if (bApplied) return; bApplied = true;
+    int32 V = 0;
+    if (FParse::Value(FCommandLine::Get(), TEXT("-rgl-skeletal-mesh-enable="), V))
+    {
+        CVarRGLSkeletalEnable->Set(V, ECVF_SetByCommandline);
+        UE_LOG(LogCarlaRGL, Warning, TEXT("RGLSceneManager[skeletal] command line: Enable=%d"), V);
+    }
+    if (FParse::Value(FCommandLine::Get(), TEXT("-rgl-skeletal-mesh-always-tick-pose="), V))
+    {
+        CVarRGLSkeletalAlwaysTickPose->Set(V, ECVF_SetByCommandline);
+        UE_LOG(LogCarlaRGL, Warning, TEXT("RGLSceneManager[skeletal] command line: AlwaysTickPose=%d"), V);
+    }
+    if (FParse::Value(FCommandLine::Get(), TEXT("-rgl-skeletal-mesh-scope="), V))
+    {
+        CVarRGLSkeletalScope->Set(V, ECVF_SetByCommandline);
+        UE_LOG(LogCarlaRGL, Warning, TEXT("RGLSceneManager[skeletal] command line: Scope=%d"), V);
+    }
+    if (FParse::Value(FCommandLine::Get(), TEXT("-rgl-skeletal-mesh-max-entities="), V))
+    {
+        CVarRGLSkeletalMaxEntities->Set(V, ECVF_SetByCommandline);
+        UE_LOG(LogCarlaRGL, Warning, TEXT("RGLSceneManager[skeletal] command line: MaxEntities=%d"), V);
+    }
+}
+
 TMap<UWorld*, FRGLSceneManager*> FRGLSceneManager::Instances;
 
 FRGLSceneManager::FRGLSceneManager()
 {
+    // Apply the Shipping-safe command-line switches before anything reads the CVars.
+    ApplySkeletalCommandLineOverrides();
+
     // Use the default scene (nullptr).
     // RGL treats nullptr as the implicit default scene.
     Scene = nullptr;
