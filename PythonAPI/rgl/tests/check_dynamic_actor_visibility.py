@@ -67,6 +67,18 @@ class Gate:
         qos = QoSProfile(depth=10); qos.reliability = ReliabilityPolicy.BEST_EFFORT; qos.durability = DurabilityPolicy.VOLATILE
         node.create_subscription(PointCloud2, ROS2_TOPIC, self._on_msg, qos)
     def _on_msg(self, msg): self.latest = {"msg": msg, "seq": self.latest["seq"] + 1}
+    def warmup(self, max_ticks=400):
+        """Tick until the first cloud arrives (ROS2 discovery + first sweep).
+        Synchronous mode only advances on tick, so keep ticking while spinning.
+        Raises MeasurementError if no cloud arrives within max_ticks."""
+        for i in range(max_ticks):
+            self.world.tick()
+            rclpy.spin_once(self.node, timeout_sec=0.02)
+            if self.latest["msg"] is not None:
+                self.last_stamp = stamp_s(self.latest["msg"])
+                print(f"warm-up: first cloud after {i + 1} ticks (stamp {self.last_stamp:.3f})")
+                return
+        raise MeasurementError(f"no point cloud after {max_ticks} warm-up ticks")
     def tick_fresh(self):
         seq0 = self.latest["seq"]; self.world.tick(); t0 = time.time()
         while time.time() - t0 < TICK_WAIT_TIMEOUT_S:
@@ -121,6 +133,7 @@ def main():
                      "rgl_lidar_topic_frame_id": "lidar", "rgl_lidar_pointcloud_format": "PointXYZIRCAEDT"}.items():
             lidar_bp.set_attribute(k, str(v))
         actors.append(spawn_or_fail(lidar_bp, carla.Transform(carla.Location(0.0, 0.0, SENSOR_Z)), "sensor.lidar.rgl"))
+        gate.warmup()
         gate.skip(SYNC_PERIOD_TICKS + SETTLE_TICKS)
         gp = world.ground_projection(carla.Location(FRONT_M, 0.0, 5.0), 20.0); ground_z = gp.location.z if gp is not None else 0.0
         spawn_tf = carla.Transform(carla.Location(FRONT_M, 0.0, ground_z + 0.3))
