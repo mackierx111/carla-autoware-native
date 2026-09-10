@@ -132,5 +132,41 @@ bool FKillSwitchTest::RunTest(const FString& Parameters)
     P->Destroy(); Step(); SM.UnregisterSensor(Sensor);
     return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FTeardownTest, "CarlaRGL.Skeletal.Scene.Teardown",
+    EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+bool FTeardownTest::RunTest(const FString& Parameters)
+{
+    UWorld* World = GetGameWorld(); if (!TestNotNull(TEXT("game world"), World)) return false;
+    USkeletalMesh* Mesh = LoadObject<USkeletalMesh>(nullptr, kWalkerSK); if (!TestNotNull(TEXT("walker SK"), Mesh)) return false;
+    FCVarGuard G1(TEXT("rgl.SkeletalMesh.Enable")); SetCVar(TEXT("rgl.SkeletalMesh.Enable"), 1);
+    const void* A = reinterpret_cast<const void*>(0xA11CE); double T = 300.0;
+
+    // (e) last sensor
+    {
+        FRGLSceneManager& SM = FRGLSceneManager::GetInstance(World);
+        APawn* P; USkeletalMeshComponent* Comp = SpawnPawn(World, Mesh, FVector(700.f, 0.f, kZ), P);
+        SM.RegisterSensor(A, FVector(0.f, 0.f, kZ), 10000.f, T); SM.SyncSkeletalNow_ForTest(World, T); SM.UpdateSkeletalPosesNow_ForTest(T);
+        TestTrue(TEXT("registered"), SM.IsSkeletalRegistered_ForTest(Comp));
+        SM.UnregisterSensor(A);
+        TestFalse(TEXT("torn down on last sensor"), SM.IsSkeletalRegistered_ForTest(Comp));
+        TestEqual(TEXT("policy restored"), (int)Comp->VisibilityBasedAnimTickOption, (int)EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered);
+        TestEqual(TEXT("cache empty"), SM.GetSkeletalMeshCacheCount_ForTest(), 0);
+        P->Destroy();
+    }
+    // (f) DestroyInstance restores components too; a fresh instance is created on next GetInstance
+    {
+        FRGLSceneManager& SM = FRGLSceneManager::GetInstance(World);
+        APawn* P; USkeletalMeshComponent* Comp = SpawnPawn(World, Mesh, FVector(800.f, 0.f, kZ), P);
+        SM.RegisterSensor(A, FVector(0.f, 0.f, kZ), 10000.f, T); SM.SyncSkeletalNow_ForTest(World, T); SM.UpdateSkeletalPosesNow_ForTest(T);
+        TestTrue(TEXT("registered"), SM.IsSkeletalRegistered_ForTest(Comp));
+        FRGLSceneManager::DestroyInstance(World);
+        TestEqual(TEXT("policy restored by DestroyInstance"), (int)Comp->VisibilityBasedAnimTickOption, (int)EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered);
+        FRGLSceneManager& Fresh = FRGLSceneManager::GetInstance(World);
+        TestEqual(TEXT("fresh instance has no skeletal entities"), Fresh.GetSkeletalRegisteredCount_ForTest(), 0);
+        P->Destroy();
+    }
+    return true;
+}
 }
 #endif

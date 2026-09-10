@@ -46,6 +46,9 @@ public:
     /// Destroy the singleton instance (call on world teardown).
     static void DestroyInstance(UWorld* World);
 
+    /// Destroy all singleton instances across all worlds (call on module shutdown).
+    static void DestroyAllInstances();
+
     /// Get the RGL scene handle. Pass to rgl_node_raytrace().
     /// Returns nullptr which RGL treats as the default scene.
     rgl_scene_t GetScene() const { return Scene; }

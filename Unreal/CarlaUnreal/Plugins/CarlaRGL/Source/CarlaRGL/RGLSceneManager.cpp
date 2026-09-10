@@ -166,6 +166,12 @@ void FRGLSceneManager::DestroyInstance(UWorld* World)
     }
 }
 
+void FRGLSceneManager::DestroyAllInstances()
+{
+    for (auto& Pair : Instances) delete Pair.Value;
+    Instances.Empty();
+}
+
 // ============================================================================
 // Update: called each frame before raytrace
 // ============================================================================
