@@ -10,6 +10,7 @@
 #include "Rendering/SkinWeightVertexBuffer.h"
 #include "Rendering/MultiSizeIndexContainer.h"
 #include "Rendering/PositionVertexBuffer.h"
+#include "Components/SkinnedMeshComponent.h"
 #include <util/ue-header-guard-end.h>
 
 namespace RGLSkeletal
@@ -157,6 +158,17 @@ bool ExtractSkeletalMesh(const USkeletalMesh* Mesh, FRGLSkeletalMeshData& Out, F
     for (int32 b = 0; b < RawBoneNum; ++b) Out.RestposesInv[b] = RGLCoord::ToRGLMat(FMatrix(Inv[b]));
     Out.RawBoneNum = RawBoneNum;
     Out.LODIndex = L;
+    return true;
+}
+
+bool BuildWorldPose(const USkinnedMeshComponent* Comp, int32 RawBoneNum, TArray<rgl_mat3x4f>& Out)
+{
+    if (!Comp || RawBoneNum <= 0) return false;
+    const TArray<FTransform>& CST = Comp->GetComponentSpaceTransforms();
+    if (CST.Num() < RawBoneNum) return false;
+    const FMatrix C2W = Comp->GetComponentTransform().ToMatrixWithScale();
+    Out.SetNumUninitialized(RawBoneNum);
+    for (int32 b = 0; b < RawBoneNum; ++b) Out[b] = RGLCoord::ToRGLMat(CST[b].ToMatrixWithScale() * C2W);
     return true;
 }
 

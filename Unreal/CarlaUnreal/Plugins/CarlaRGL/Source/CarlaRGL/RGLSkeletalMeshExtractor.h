@@ -39,6 +39,10 @@ namespace RGLSkeletal
     bool  IsLODReadable(const USkeletalMesh* Mesh, int32 LODIndex, FRGLSkeletalLODReadiness& Out);
     int32 SelectReadableLOD(const USkeletalMesh* Mesh, FString& OutReason);
     bool  ExtractSkeletalMesh(const USkeletalMesh* Mesh, FRGLSkeletalMeshData& Out, FString& OutReason);
-    // Task 4 adds: bool BuildWorldPose(const USkinnedMeshComponent*, int32 RawBoneNum, TArray<rgl_mat3x4f>&);
+
+    // World-space bone matrices for rgl_entity_set_pose_world:
+    //   Out[b] = ToRGLMat(ComponentSpaceTransform[b] * ComponentToWorld)   (UE row-vector: child * parent)
+    // Returns false (Out untouched) if fewer than RawBoneNum component-space transforms exist.
+    bool BuildWorldPose(const USkinnedMeshComponent* Comp, int32 RawBoneNum, TArray<rgl_mat3x4f>& Out);
 }
 #endif // WITH_RGL
