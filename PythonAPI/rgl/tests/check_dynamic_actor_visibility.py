@@ -136,7 +136,6 @@ def main():
         gate.warmup()
         gate.skip(SYNC_PERIOD_TICKS + SETTLE_TICKS)
         gp = world.ground_projection(carla.Location(FRONT_M, 0.0, 5.0), 20.0); ground_z = gp.location.z if gp is not None else 0.0
-        spawn_tf = carla.Transform(carla.Location(FRONT_M, 0.0, ground_z + 0.3))
 
         nc_roi = (FRONT_M - 3.0, FRONT_M + 3.0, -1.5, 1.5, ground_z + Z_LO, ground_z + Z_HI)
         b1, b2 = gate.measure(nc_roi), gate.measure(nc_roi)
@@ -147,13 +146,16 @@ def main():
             try: target_bp = bp.find(bp_id)
             except Exception: raise MeasurementError(f"required blueprint not found: {bp_id}")
             is_walker = bp_id.startswith("walker.")
-            probe = spawn_or_fail(target_bp, spawn_tf, bp_id)
+            z_off = 1.0 if is_walker else 0.3
+            tf = carla.Transform(carla.Location(FRONT_M, 0.0, ground_z + z_off))
+            print(f"[{args.label}] spawned {bp_id} at z={ground_z + z_off:.2f}")
+            probe = spawn_or_fail(target_bp, tf, bp_id)
             actors.append(probe); gate.skip(SETTLE_TICKS); roi, bb = roi_for(probe, ground_z)
             probe.destroy(); actors.remove(probe); gate.skip(SYNC_PERIOD_TICKS + SETTLE_TICKS)
             base1, base2 = gate.measure(roi), gate.measure(roi)
             if not stable(base1, base2): raise MeasurementError(f"baseline unstable for {bp_id}: {base1} vs {base2}")
             base = median([base1, base2])
-            actor = spawn_or_fail(target_bp, spawn_tf, bp_id)
+            actor = spawn_or_fail(target_bp, tf, bp_id)
             actors.append(actor); gate.skip(SYNC_PERIOD_TICKS + SETTLE_TICKS)
             meas = gate.measure(roi)
             actor.destroy(); actors.remove(actor); gate.skip(SYNC_PERIOD_TICKS + SETTLE_TICKS)
