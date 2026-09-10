@@ -79,25 +79,29 @@ bool IsLODReadable(const USkeletalMesh* Mesh, int32 LODIndex, FRGLSkeletalLODRea
     return true;
 }
 
-int32 SelectReadableLOD(const USkeletalMesh* Mesh, FString& OutReason)
+int32 SelectReadableLOD(const USkeletalMesh* Mesh, FString& OutReason, int32 MinLOD)
 {
     const FSkeletalMeshRenderData* RD = Mesh ? Mesh->GetResourceForRendering() : nullptr;
     if (!RD) { OutReason = TEXT("no render data"); return -1; }
+    const int32 NumLODs = RD->LODRenderData.Num();
+    if (NumLODs <= 0) { OutReason = TEXT("NoResidentLOD (no LOD render data)"); return -1; }
+    // MinLOD floors the scan; clamping keeps an over-large CVar value from disabling every asset.
+    const int32 First = FMath::Clamp(MinLOD, 0, NumLODs - 1);
     FString Reasons;
-    for (int32 L = 0; L < RD->LODRenderData.Num(); ++L)
+    for (int32 L = First; L < NumLODs; ++L)
     {
         FRGLSkeletalLODReadiness R;
         if (IsLODReadable(Mesh, L, R)) return L;
         Reasons += FString::Printf(TEXT("[LOD%d: %s] "), L, *R.FailReason);
     }
-    OutReason = TEXT("NoResidentLOD ") + Reasons;
+    OutReason = FString::Printf(TEXT("NoResidentLOD (from LOD%d) "), First) + Reasons;
     return -1;
 }
 
-bool ExtractSkeletalMesh(const USkeletalMesh* Mesh, FRGLSkeletalMeshData& Out, FString& OutReason)
+bool ExtractSkeletalMesh(const USkeletalMesh* Mesh, FRGLSkeletalMeshData& Out, FString& OutReason, int32 MinLOD)
 {
     Out = FRGLSkeletalMeshData();
-    const int32 L = SelectReadableLOD(Mesh, OutReason);
+    const int32 L = SelectReadableLOD(Mesh, OutReason, MinLOD);
     if (L < 0) return false;
 
     const FSkeletalMeshLODRenderData& LOD = Mesh->GetResourceForRendering()->LODRenderData[L];
@@ -116,7 +120,10 @@ bool ExtractSkeletalMesh(const USkeletalMesh* Mesh, FRGLSkeletalMeshData& Out, F
 
     Out.Weights.SetNumZeroed(NumVerts);
     TBitArray<> VertexDone(false, NumVerts);
-    const int32 MaxInf = static_cast<int32>(SW->GetMaxBoneInfluences());
+    // "Unlimited bone influences" assets report > MAX_TOTAL_INFLUENCES, but FSkinWeightInfo only
+    // holds MAX_TOTAL_INFLUENCES entries and so do the per-vertex stack arrays below. Truncating
+    // is safe: ReduceInfluences keeps the 4 largest of what it is given and renormalises.
+    const int32 MaxInf = FMath::Min<int32>(static_cast<int32>(SW->GetMaxBoneInfluences()), MAX_TOTAL_INFLUENCES);
     for (const FSkelMeshRenderSection& S : LOD.RenderSections)
     {
         if (S.bDisabled) continue;

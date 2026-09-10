@@ -9,6 +9,8 @@
 #include "RGLSkeletalMeshExtractor.h"
 #include "RGLDynLoader.h"
 
+#include <cstdio>   // Shipping breadcrumbs: NO_LOGGING compiles UE_LOG out (precedent: RGLDynLoader.cpp)
+
 #include <util/ue-header-guard-begin.h>
 #include "Engine/World.h"
 #include "Engine/StaticMesh.h"
@@ -53,8 +55,12 @@ static TAutoConsoleVariable<int32> CVarRGLSkeletalAlwaysTickPose(TEXT("rgl.Skele
     TEXT("Force AlwaysTickPoseAndRefreshBones and disable URO on registered skeletal components (live: re-applied/restored at next sync)."), ECVF_Default);
 static TAutoConsoleVariable<int32> CVarRGLSkeletalScope(TEXT("rgl.SkeletalMesh.Scope"), 0,
     TEXT("0 = APawn-owned components only. 1 = every USkeletalMeshComponent."), ECVF_Default);
-static TAutoConsoleVariable<int32> CVarRGLSkeletalMaxEntities(TEXT("rgl.SkeletalMesh.MaxEntities"), 256,
-    TEXT("Budget of simultaneously registered skeletal components; ranked by distance to the nearest sensor."), ECVF_Default);
+static TAutoConsoleVariable<int32> CVarRGLSkeletalMaxEntities(TEXT("rgl.SkeletalMesh.MaxEntities"), 64,
+    TEXT("Budget of simultaneously registered skeletal components; ranked by distance to the nearest sensor. "
+         "Device memory is roughly 24 B per vertex per registered entity (RGL SkeletonAnimator + GAS), "
+         "so a 350k-vertex LOD0 vehicle costs ~8 MB; lower this (or raise MinLOD) on VRAM-tight setups."), ECVF_Default);
+static TAutoConsoleVariable<int32> CVarRGLSkeletalMinLOD(TEXT("rgl.SkeletalMesh.MinLOD"), 0,
+    TEXT("Lowest LOD index the extractor may use; raise to trade fidelity for VRAM/skinning cost."), ECVF_Default);
 #if !UE_BUILD_SHIPPING
 static TAutoConsoleVariable<int32> CVarRGLSkeletalDebugForceApiUnavailable(TEXT("rgl.SkeletalMesh.Debug.ForceApiUnavailable"), 0,
     TEXT("Test only: pretend the RGL skeleton API did not resolve."), ECVF_Default);
@@ -92,6 +98,11 @@ static void ApplySkeletalCommandLineOverrides()
     {
         CVarRGLSkeletalMaxEntities->Set(V, ECVF_SetByCommandline);
         UE_LOG(LogCarlaRGL, Warning, TEXT("RGLSceneManager[skeletal] command line: MaxEntities=%d"), V);
+    }
+    if (FParse::Value(FCommandLine::Get(), TEXT("-rgl-skeletal-mesh-min-lod="), V))
+    {
+        CVarRGLSkeletalMinLOD->Set(V, ECVF_SetByCommandline);
+        UE_LOG(LogCarlaRGL, Warning, TEXT("RGLSceneManager[skeletal] command line: MinLOD=%d"), V);
     }
 }
 
@@ -1669,16 +1680,12 @@ bool FRGLSceneManager::SkeletalEnabled() const
     return bApi && CVarRGLSkeletalEnable.GetValueOnGameThread() != 0;
 }
 
-// Identity of a (component, asset) pair for the warn-once and permanent-skip sets.
-// An asset swap changes the key, so the pair is re-evaluated naturally.
-uint64 FRGLSceneManager::SkeletalPairKey(const USkeletalMeshComponent* Comp, const USkeletalMesh* Mesh)
-{
-    return (static_cast<uint64>(PointerHash(Comp)) << 32) ^ static_cast<uint64>(PointerHash(Mesh));
-}
-
 void FRGLSceneManager::WarnSkeletalOnce(const USkeletalMeshComponent* Comp, const USkeletalMesh* Mesh, const FString& Msg)
 {
-    const uint64 Key = SkeletalPairKey(Comp, Mesh);
+    // (component, asset, reason) identity. FObjectKey carries the object's serial number, so an
+    // address recycled by GC starts with a clean slate; the reason hash lets a *different* later
+    // failure for the same pair (e.g. permanent skip after "not readable yet") still be logged once.
+    const FSkeletalWarnKey Key = MakeTuple(FObjectKey(Comp), FObjectKey(Mesh), GetTypeHash(Msg));
     if (SkeletalWarned.Contains(Key)) return;
     SkeletalWarned.Add(Key);
     UE_LOG(LogCarlaRGL, Warning, TEXT("RGLSceneManager[skeletal] %s (%s / %s)"), *Msg, Comp ? *Comp->GetPathName() : TEXT("?"), Mesh ? *Mesh->GetName() : TEXT("?"));
@@ -1697,8 +1704,8 @@ bool FRGLSceneManager::ShouldRegisterSkeletalComponent(USkeletalMeshComponent* C
     if (RegisteredSensors.Num() == 0 || !IsWithinAnySensor(B.Origin, B.SphereRadius, 0.0f)) { bOutOfRange = true; return false; }
     // Permanently skipped after a non-recoverable extraction/upload failure (spec §6.1);
     // hard disqualifier, so no hysteresis and no repeated extraction attempts.
-    if (SkeletalSkipped.Contains(SkeletalPairKey(Comp, Comp->GetSkeletalMeshAsset()))) return false;
-    if (RGLSkeletal::SelectReadableLOD(Comp->GetSkeletalMeshAsset(), OutReason) < 0) { bRetryLater = true; return false; }
+    if (SkeletalSkipped.Contains(FSkeletalSkipKey(FObjectKey(Comp), FObjectKey(Comp->GetSkeletalMeshAsset())))) return false;
+    if (RGLSkeletal::SelectReadableLOD(Comp->GetSkeletalMeshAsset(), OutReason, CVarRGLSkeletalMinLOD.GetValueOnGameThread()) < 0) { bRetryLater = true; return false; }
     return true;
 }
 
@@ -1708,7 +1715,10 @@ rgl_mesh_t FRGLSceneManager::GetOrUploadSkeletalMesh(USkeletalMesh* Mesh, int32&
     // Resolve the cache key WITHOUT extracting: SelectReadableLOD only inspects buffer
     // sizes, whereas ExtractSkeletalMesh walks every vertex. N pawns sharing one asset
     // must therefore cost one extraction, not N (spec §4.2).
-    const int32 LOD = RGLSkeletal::SelectReadableLOD(Mesh, OutReason);
+    // MinLOD is part of the selection, and the cache key carries the LOD actually used, so a live
+    // MinLOD change simply produces new cache entries when components are (re-)registered.
+    const int32 MinLOD = CVarRGLSkeletalMinLOD.GetValueOnGameThread();
+    const int32 LOD = RGLSkeletal::SelectReadableLOD(Mesh, OutReason, MinLOD);
     if (LOD < 0) return nullptr;   // §3.1 readiness not met: retry later, OutLOD stays < 0
     // From here on OutLOD >= 0, which tells the caller readiness passed and any later
     // failure is non-recoverable and must be skipped permanently (spec §6.1).
@@ -1721,7 +1731,7 @@ rgl_mesh_t FRGLSceneManager::GetOrUploadSkeletalMesh(USkeletalMesh* Mesh, int32&
     }
 
     FRGLSkeletalMeshData Data;
-    if (!RGLSkeletal::ExtractSkeletalMesh(Mesh, Data, OutReason)) return nullptr;
+    if (!RGLSkeletal::ExtractSkeletalMesh(Mesh, Data, OutReason, MinLOD)) return nullptr;
     // ExtractSkeletalMesh selects the same lowest readable LOD; a divergence would put
     // the entity on a mesh cached under the wrong key.
     if (Data.LODIndex != LOD) { OutReason = FString::Printf(TEXT("LOD mismatch: SelectReadableLOD=%d ExtractSkeletalMesh=%d"), LOD, Data.LODIndex); return nullptr; }
@@ -1732,6 +1742,15 @@ rgl_mesh_t FRGLSceneManager::GetOrUploadSkeletalMesh(USkeletalMesh* Mesh, int32&
     if (rgl_mesh_set_restposes(M, Data.RestposesInv.GetData(), Data.RestposesInv.Num()) != RGL_SUCCESS) { RglDestroyChecked(rgl_mesh_destroy(M), TEXT("rgl_mesh_destroy")); OutReason = TEXT("rgl_mesh_set_restposes failed"); return nullptr; }
     SkeletalMeshCache.Add(Key, M);
     UE_LOG(LogCarlaRGL, Log, TEXT("RGLSceneManager[skeletal] uploaded %s LOD=%d verts=%d tris=%d rawBones=%d"), *Mesh->GetName(), Data.LODIndex, Data.Vertices.Num(), Data.Indices.Num(), Data.RawBoneNum);
+    // Shipping has NO_LOGGING, so the line above vanishes there. One stderr breadcrumb per process
+    // is enough to tell an operator that the skeletal path is actually live in a packaged server.
+    static bool bFirstSkeletalUploadLogged = false;
+    if (!bFirstSkeletalUploadLogged)
+    {
+        bFirstSkeletalUploadLogged = true;
+        fprintf(stderr, "CarlaRGL[skeletal]: first skeletal mesh uploaded (%s LOD=%d verts=%d bones=%d); skeletal path active\n",
+                TCHAR_TO_UTF8(*Mesh->GetName()), Data.LODIndex, Data.Vertices.Num(), Data.RawBoneNum);
+    }
     return M;
 }
 
@@ -1772,7 +1791,14 @@ bool FRGLSceneManager::RegisterSkeletalComponent(USkeletalMeshComponent* Comp)
         // LOD >= 0 means readiness passed and extraction/upload itself failed: not a
         // §3.1 condition, so never retry this (component, asset) pair (spec §6.1).
         // Readiness failures cannot reach here (ShouldRegisterSkeletalComponent returns bRetryLater).
-        if (LOD >= 0) SkeletalSkipped.Add(SkeletalPairKey(Comp, Mesh));
+        if (LOD >= 0)
+        {
+            SkeletalSkipped.Add(FSkeletalSkipKey(FObjectKey(Comp), FObjectKey(Mesh)));
+            // Shipping has no log: a permanent skip silently removes an actor from the point cloud,
+            // so leave a stderr breadcrumb (LOD >= 0 implies Mesh != nullptr; Comp is IsValid here).
+            fprintf(stderr, "CarlaRGL[skeletal]: permanently skipping %s (%s): %s\n",
+                    TCHAR_TO_UTF8(*Comp->GetPathName()), TCHAR_TO_UTF8(*Mesh->GetName()), TCHAR_TO_UTF8(*Reason));
+        }
         WarnSkeletalOnce(Comp, Mesh, TEXT("skipped: ") + Reason);
         return false;
     }
@@ -1867,28 +1893,39 @@ void FRGLSceneManager::SyncSkeletalComponents(UWorld* World)
             Eligible.Add({ C, Best });
         }
     }
-    // 2) Unregister: dead, hard-disqualified, or out of range beyond hysteresis.
+    // 2) Unregister: dead, hard-disqualified, or out of range beyond hysteresis. Registrations that
+    //    survive this step but are NOT eligible ("retained" by hysteresis) still occupy VRAM, so
+    //    they are ranked alongside the eligible candidates in step 3 (spec §4.2-5).
     TSet<USkeletalMeshComponent*> EligibleSet; for (const FCand& C : Eligible) EligibleSet.Add(C.Comp);
-    TArray<USkeletalMeshComponent*> ToRemove;
+    TArray<USkeletalMeshComponent*> ToRemove; TArray<FCand> Retained;
     for (auto& Pair : SkeletalEntityMap)
     {
         USkeletalMeshComponent* Live = Pair.Value.Component.Get();
         if (!Live || !IsValid(Live) || Disqualified.Contains(Pair.Key)) { ToRemove.Add(Pair.Key); continue; }
-        if (EligibleSet.Contains(Pair.Key)) continue;
+        if (EligibleSet.Contains(Pair.Key)) continue;   // already ranked as an eligible candidate
         const FBoxSphereBounds B = Live->Bounds;
-        if (!IsWithinAnySensor(B.Origin, B.SphereRadius, UnregistrationHysteresisCm)) ToRemove.Add(Pair.Key);
+        if (!IsWithinAnySensor(B.Origin, B.SphereRadius, UnregistrationHysteresisCm)) { ToRemove.Add(Pair.Key); continue; }
+        float Best = TNumericLimits<float>::Max();
+        for (const auto& S : RegisteredSensors) Best = FMath::Min(Best, (float)FVector::DistSquared(S.Value.Position, B.Origin));
+        Retained.Add({ Pair.Key, Best });
     }
     for (USkeletalMeshComponent* K : ToRemove) UnregisterSkeletalComponent(K);
-    // 3) Budget over the WHOLE eligible set (registered + new), nearest first: drop over-budget registered, add within budget.
-    Eligible.Sort([](const FCand& A, const FCand& B) { return A.DistSq < B.DistSq; });
-    TArray<USkeletalMeshComponent*> OverBudget; int32 Added = 0;
-    for (int32 i = 0; i < Eligible.Num(); ++i)
+    // 3) Budget over the UNION of eligible candidates and hysteresis-retained registrations,
+    //    nearest first. Everything past MaxEntities is unregistered FIRST (so MaxEntities=0 really
+    //    empties the set), then the in-budget newcomers are registered.
+    TArray<FCand> Ranked = MoveTemp(Eligible);
+    Ranked.Append(Retained);
+    Ranked.Sort([](const FCand& A, const FCand& B) { return A.DistSq < B.DistSq; });
+    TArray<USkeletalMeshComponent*> OverBudget;
+    for (int32 i = MaxEntities; i < Ranked.Num(); ++i)
+        if (SkeletalEntityMap.Contains(Ranked[i].Comp)) OverBudget.Add(Ranked[i].Comp);
+    for (USkeletalMeshComponent* K : OverBudget) UnregisterSkeletalComponent(K);
+    int32 Added = 0;
+    for (int32 i = 0, N = FMath::Min(MaxEntities, Ranked.Num()); i < N; ++i)
     {
-        USkeletalMeshComponent* C = Eligible[i].Comp;
-        if (i >= MaxEntities) { if (SkeletalEntityMap.Contains(C)) OverBudget.Add(C); continue; }
+        USkeletalMeshComponent* C = Ranked[i].Comp;
         if (!SkeletalEntityMap.Contains(C) && RegisterSkeletalComponent(C)) ++Added;
     }
-    for (USkeletalMeshComponent* K : OverBudget) UnregisterSkeletalComponent(K);
     if (Added || ToRemove.Num() || OverBudget.Num())
         RGLLog::Info("RGLSceneManager[skeletal]: registered=", SkeletalEntityMap.Num(), " cachedMeshes=", SkeletalMeshCache.Num(),
                      " added=", Added, " removed=", ToRemove.Num() + OverBudget.Num(), " range-skipped=", RangeSkipped, " retry-later=", RetryLater);

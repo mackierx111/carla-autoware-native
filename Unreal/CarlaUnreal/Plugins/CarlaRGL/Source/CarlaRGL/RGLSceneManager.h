@@ -20,6 +20,7 @@
 #include <util/ue-header-guard-begin.h>
 #include "CoreMinimal.h"
 #include "UObject/WeakObjectPtrTemplates.h"
+#include "UObject/ObjectKey.h"                 // FObjectKey: generation-aware object identity
 #include "Engine/StaticMesh.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
@@ -166,14 +167,19 @@ private:
     TMap<USkeletalMeshComponent*, FSkeletalEntityInfo> SkeletalEntityMap;
     TMap<FSkeletalMeshKey, rgl_mesh_t>                 SkeletalMeshCache;
     TMap<FSkeletalMeshKey, int32>                      SkeletalMeshRefCounts;
-    TSet<uint64>                                       SkeletalWarned;
+    /// Log suppression key: (component, asset, hash(message)). FObjectKey is generation-aware,
+    /// so a GC'd address reused by a new component never inherits an old suppression; including
+    /// the message hash keeps a *different* later failure for the same pair loggable once too.
+    using FSkeletalWarnKey = TTuple<FObjectKey, FObjectKey, uint32>;
+    /// (component, asset) identity for the permanent-skip set.
+    using FSkeletalSkipKey = TPair<FObjectKey, FObjectKey>;
+    TSet<FSkeletalWarnKey>                             SkeletalWarned;
     /// (component, asset) pairs whose extraction/upload failed for a non-recoverable
     /// reason (spec §6.1: only §3.1 readiness failures are retried). Permanently skipped.
-    TSet<uint64>                                       SkeletalSkipped;
+    TSet<FSkeletalSkipKey>                             SkeletalSkipped;
     bool                                               bSkeletalApiAvailable = false;
 
     static void RglDestroyChecked(rgl_status_t Status, const TCHAR* Api);
-    static uint64 SkeletalPairKey(const USkeletalMeshComponent* Comp, const USkeletalMesh* Mesh);
     bool  SkeletalEnabled() const;
     bool  ShouldRegisterSkeletalComponent(USkeletalMeshComponent* Comp, bool& bOutOfRange, bool& bRetryLater, FString& OutReason) const;
     bool  RegisterSkeletalComponent(USkeletalMeshComponent* Comp);

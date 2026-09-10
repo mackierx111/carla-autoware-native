@@ -37,8 +37,10 @@ namespace RGLSkeletal
 {
     bool  ReduceInfluences(const int32* RawBones, const uint16* Weights16, int32 Count, rgl_bone_weights_t& Out);
     bool  IsLODReadable(const USkeletalMesh* Mesh, int32 LODIndex, FRGLSkeletalLODReadiness& Out);
-    int32 SelectReadableLOD(const USkeletalMesh* Mesh, FString& OutReason);
-    bool  ExtractSkeletalMesh(const USkeletalMesh* Mesh, FRGLSkeletalMeshData& Out, FString& OutReason);
+    // MinLOD = lowest LOD index the scan may start from (clamped to the available range);
+    // raise it to trade fidelity for VRAM / GPU skinning cost (CVar rgl.SkeletalMesh.MinLOD).
+    int32 SelectReadableLOD(const USkeletalMesh* Mesh, FString& OutReason, int32 MinLOD = 0);
+    bool  ExtractSkeletalMesh(const USkeletalMesh* Mesh, FRGLSkeletalMeshData& Out, FString& OutReason, int32 MinLOD = 0);
 
     // World-space bone matrices for rgl_entity_set_pose_world:
     //   Out[b] = ToRGLMat(ComponentSpaceTransform[b] * ComponentToWorld)   (UE row-vector: child * parent)
