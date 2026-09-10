@@ -23,11 +23,14 @@
 #include "Engine/StaticMesh.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
+#include "Components/SkinnedMeshComponent.h"   // EVisibilityBasedAnimTickOption
 #include <util/ue-header-guard-end.h>
 
 // Forward declarations
 class UWorld;
 class AActor;
+class USkeletalMeshComponent;
+class USkeletalMesh;
 
 /// Manages synchronization between the UE5 scene and the RGL scene.
 /// Call Update() each tick before running the RGL raytrace graph.
@@ -69,17 +72,23 @@ public:
         S.LastUpdateTime = Now;
     }
 
-    /// Remove a sensor when its session is destroyed.
-    void UnregisterSensor(const void* SensorId)
-    {
-        RegisteredSensors.Remove(SensorId);
-    }
-
     /// Set the world sync interval in simulation seconds. Default: 1.0s. Minimum: 0.1s.
     void SetSyncInterval(float Seconds) { SyncIntervalSeconds = FMath::Max(0.1f, Seconds); }
 
     /// Check if the scene manager has been initialized.
     bool IsInitialized() const { return bInitialized; }
+
+    /// Remove a sensor when its session is destroyed (defined in .cpp; tears skeletal state down when none remain).
+    void UnregisterSensor(const void* SensorId);
+#if !UE_BUILD_SHIPPING
+    // Test seams: bypass the per-frame guard and the wall-clock sync timer; set scene time like Update() does.
+    void SyncSkeletalNow_ForTest(UWorld* World, double SimTime);
+    void UpdateSkeletalPosesNow_ForTest(double SimTime);
+    int32 GetSkeletalRegisteredCount_ForTest() const { return SkeletalEntityMap.Num(); }
+    int32 GetSkeletalLiveEntityCount_ForTest() const;
+    int32 GetSkeletalMeshCacheCount_ForTest() const { return SkeletalMeshCache.Num(); }
+    bool  IsSkeletalRegistered_ForTest(const USkeletalMeshComponent* Comp) const { return SkeletalEntityMap.Contains(const_cast<USkeletalMeshComponent*>(Comp)); }
+#endif
 
 private:
     FRGLSceneManager();
@@ -131,6 +140,44 @@ private:
 
     /// Scan world for new/removed components since last update.
     void SyncWorldComponents(UWorld* World);
+
+    // ---- Skeletal mesh path (spec 2026-09-10-rgl-skeletal-mesh-design.md) ----
+    struct FSkeletalEntityInfo
+    {
+        rgl_entity_t                           Entity = nullptr;   // nullptr = pending first pose
+        TWeakObjectPtr<USkeletalMeshComponent> Component;
+        USkeletalMesh*                         SkeletalMesh = nullptr;
+        int32                                  LODIndex = -1;
+        int32                                  RawBoneNum = 0;
+        TArray<rgl_mat3x4f>                    PoseScratch;
+        EVisibilityBasedAnimTickOption         SavedTickOption = EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones;
+        bool                                   bSavedURO = true;
+        bool                                   bTickPolicyApplied = false;
+    };
+    struct FSkeletalMeshKey
+    {
+        USkeletalMesh* Mesh = nullptr; int32 LOD = -1;
+        bool operator==(const FSkeletalMeshKey& O) const { return Mesh == O.Mesh && LOD == O.LOD; }
+        friend uint32 GetTypeHash(const FSkeletalMeshKey& K) { return HashCombine(PointerHash(K.Mesh), GetTypeHash(K.LOD)); }
+    };
+    TMap<USkeletalMeshComponent*, FSkeletalEntityInfo> SkeletalEntityMap;
+    TMap<FSkeletalMeshKey, rgl_mesh_t>                 SkeletalMeshCache;
+    TMap<FSkeletalMeshKey, int32>                      SkeletalMeshRefCounts;
+    TSet<uint64>                                       SkeletalWarned;
+    bool                                               bSkeletalApiAvailable = false;
+
+    static void RglDestroyChecked(rgl_status_t Status, const TCHAR* Api);
+    bool  SkeletalEnabled() const;
+    bool  ShouldRegisterSkeletalComponent(USkeletalMeshComponent* Comp, bool& bOutOfRange, bool& bRetryLater, FString& OutReason) const;
+    bool  RegisterSkeletalComponent(USkeletalMeshComponent* Comp);
+    void  UnregisterSkeletalComponent(USkeletalMeshComponent* Key);
+    void  UpdateSkeletalPoses();
+    void  SyncSkeletalComponents(UWorld* World);
+    void  TeardownSkeletal();
+    void  ApplyTickPolicy(USkeletalMeshComponent* Comp, FSkeletalEntityInfo& Info, bool bEnable);
+    void  WarnSkeletalOnce(const USkeletalMeshComponent* Comp, const USkeletalMesh* Mesh, const FString& Msg);
+    rgl_mesh_t GetOrUploadSkeletalMesh(USkeletalMesh* Mesh, int32& OutLOD, int32& OutRawBoneNum, FString& OutReason);
+    void  ReleaseSkeletalMeshReference(const FSkeletalMeshKey& Key);
 
     /// Create a large ground plane in the RGL scene to represent the road surface.
     void CreateGroundPlane();
