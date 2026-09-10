@@ -75,7 +75,7 @@ bool FMatrixIdentityTest::RunTest(const FString& Parameters)
         TestTrue(TEXT("actor transform applied"), Comp->GetComponentTransform().Equals(kActorTf, 1e-2f));
 
         TArray<rgl_mat3x4f> Pose;
-        TestTrue(TEXT("BuildWorldPose"), RGLSkeletal::BuildWorldPose(Comp, Data.RawBoneNum, Pose));
+        if (!TestTrue(FString::Printf(TEXT("%s BuildWorldPose"), Path), RGLSkeletal::BuildWorldPose(Comp, Data.RawBoneNum, Pose))) { Actor->Destroy(); continue; }
         TArray<FMatrix44f> RefToLocal; Comp->CacheRefToLocalMatrices(RefToLocal);   // RefInv[b]*CST[b] (UE row-vector)
         const FMatrix C2W = Comp->GetComponentTransform().ToMatrixWithScale();
         float MaxErr = 0.f;
@@ -112,7 +112,8 @@ bool FVertexReplayTest::RunTest(const FString& Parameters)
         USkinnedMeshComponent::ComputeSkinnedPositions(Comp, Oracle, RefToLocal, LOD, *SW);
         if (!TestEqual(TEXT("oracle vertex count"), Oracle.Num(), Data.Vertices.Num())) { Actor->Destroy(); continue; }
 
-        TArray<rgl_mat3x4f> Pose; RGLSkeletal::BuildWorldPose(Comp, Data.RawBoneNum, Pose);
+        TArray<rgl_mat3x4f> Pose;
+        if (!TestTrue(FString::Printf(TEXT("%s BuildWorldPose"), Path), RGLSkeletal::BuildWorldPose(Comp, Data.RawBoneNum, Pose))) { Actor->Destroy(); continue; }
         TArray<rgl_mat3x4f> Anim; Anim.SetNum(Data.RawBoneNum);
         for (int32 b = 0; b < Data.RawBoneNum; ++b) Anim[b] = RGLCoord::MulRGL(Pose[b], Data.RestposesInv[b]);
         const FTransform C2W = Comp->GetComponentTransform();
@@ -137,12 +138,18 @@ bool FVertexReplayTest::RunTest(const FString& Parameters)
                     if (Info.InfluenceWeights[k] > 0)
                         P += ApplyRGL(Anim[SectionOf[v]->BoneMap[Info.InfluenceBones[k]]], Data.Vertices[v]) * (Info.InfluenceWeights[k] / 65535.f);
                 ExactMax = FMath::Max(ExactMax, (float)(FVector(P) - Ow).Size()); ++ExactN;
+
+                // (1b) approx: our reduced 4 influences. Gated by the same SectionOf[v] check as the
+                // exact branch: outside every enabled section, Data.Weights[v] is the extractor's
+                // fabricated rigid bone-0 fallback (not a real skinned position), so comparing it
+                // against the oracle (which skins across ALL sections, including disabled ones) would
+                // inflate p99/max with a meaningless error.
+                FVector3f Q(0.f); const rgl_bone_weights_t& W = Data.Weights[v];
+                for (int k = 0; k < 4; ++k) if (W.weights[k] > 0.f) Q += ApplyRGL(Anim[W.bone_indexes[k]], Data.Vertices[v]) * W.weights[k];
+                ApproxErr.Add((FVector(Q) - Ow).Size());
             }
-            // (1b) approx: our reduced 4 influences
-            FVector3f Q(0.f); const rgl_bone_weights_t& W = Data.Weights[v];
-            for (int k = 0; k < 4; ++k) if (W.weights[k] > 0.f) Q += ApplyRGL(Anim[W.bone_indexes[k]], Data.Vertices[v]) * W.weights[k];
-            ApproxErr.Add((FVector(Q) - Ow).Size());
         }
+        if (!TestTrue(FString::Printf(TEXT("%s at least one section-covered vertex for approx stats"), Path), ApproxErr.Num() > 0)) { Actor->Destroy(); continue; }
         ApproxErr.Sort();
         const float P99 = ApproxErr[FMath::Clamp(int32(ApproxErr.Num() * 0.99f), 0, ApproxErr.Num() - 1)];
         AddInfo(FString::Printf(TEXT("%s exact(all-influence) max=%.6f m over %d verts; approx(4) p99=%.4f max=%.4f m"), Path, ExactMax, ExactN, P99, ApproxErr.Last()));
