@@ -100,15 +100,27 @@ def main():
 
     client = carla.Client(args.host, args.port); client.set_timeout(20.0); world = client.get_world()
     original = world.get_settings(); node = None; actors = []; results = []; rc = 0
+
+    def spawn_or_fail(bp_obj, tf, what):
+        try:
+            a = world.try_spawn_actor(bp_obj, tf)
+        except Exception as e:
+            raise MeasurementError(f"spawn raised for {what}: {e}")
+        if a is None:
+            raise MeasurementError(f"spawn failed: {what}")
+        return a
+
     try:
         s = world.get_settings(); s.synchronous_mode = True; s.fixed_delta_seconds = 1.0 / ROT_HZ; world.apply_settings(s)
         rclpy.init(); node = rclpy.create_node("rgl_dynamic_actor_visibility_gate"); gate = Gate(world, node, args.ticks)
-        bp = world.get_blueprint_library(); lidar_bp = bp.find("sensor.lidar.rgl")
+        bp = world.get_blueprint_library()
+        try: lidar_bp = bp.find("sensor.lidar.rgl")
+        except Exception: raise MeasurementError("required blueprint not found: sensor.lidar.rgl")
         for k, v in {"channels": CHANNELS, "range": 50, "upper_fov": UPPER, "lower_fov": LOWER, "points_per_second": PPS,
                      "rotation_frequency": ROT_HZ, "sensor_tick": 1.0 / ROT_HZ, "rgl_lidar_topic_name": ROS2_TOPIC,
                      "rgl_lidar_topic_frame_id": "lidar", "rgl_lidar_pointcloud_format": "PointXYZIRCAEDT"}.items():
             lidar_bp.set_attribute(k, str(v))
-        actors.append(world.spawn_actor(lidar_bp, carla.Transform(carla.Location(0.0, 0.0, SENSOR_Z))))
+        actors.append(spawn_or_fail(lidar_bp, carla.Transform(carla.Location(0.0, 0.0, SENSOR_Z)), "sensor.lidar.rgl"))
         gate.skip(SYNC_PERIOD_TICKS + SETTLE_TICKS)
         gp = world.ground_projection(carla.Location(FRONT_M, 0.0, 5.0), 20.0); ground_z = gp.location.z if gp is not None else 0.0
         spawn_tf = carla.Transform(carla.Location(FRONT_M, 0.0, ground_z + 0.3))
@@ -122,15 +134,13 @@ def main():
             try: target_bp = bp.find(bp_id)
             except Exception: raise MeasurementError(f"required blueprint not found: {bp_id}")
             is_walker = bp_id.startswith("walker.")
-            probe = world.spawn_actor(target_bp, spawn_tf)
-            if probe is None: raise MeasurementError(f"spawn failed: {bp_id}")
+            probe = spawn_or_fail(target_bp, spawn_tf, bp_id)
             actors.append(probe); gate.skip(SETTLE_TICKS); roi, bb = roi_for(probe, ground_z)
             probe.destroy(); actors.remove(probe); gate.skip(SYNC_PERIOD_TICKS + SETTLE_TICKS)
             base1, base2 = gate.measure(roi), gate.measure(roi)
             if not stable(base1, base2): raise MeasurementError(f"baseline unstable for {bp_id}: {base1} vs {base2}")
             base = median([base1, base2])
-            actor = world.spawn_actor(target_bp, spawn_tf)
-            if actor is None: raise MeasurementError(f"spawn failed: {bp_id}")
+            actor = spawn_or_fail(target_bp, spawn_tf, bp_id)
             actors.append(actor); gate.skip(SYNC_PERIOD_TICKS + SETTLE_TICKS)
             meas = gate.measure(roi)
             actor.destroy(); actors.remove(actor); gate.skip(SYNC_PERIOD_TICKS + SETTLE_TICKS)
@@ -144,6 +154,8 @@ def main():
         return rc
     except MeasurementError as e:
         print(f"[{args.label}] ERROR (measurement failure): {e}", file=sys.stderr); return 2
+    except Exception as e:
+        print(f"[{args.label}] ERROR (unexpected exception, treated as measurement failure): {type(e).__name__}: {e}", file=sys.stderr); return 2
     finally:
         for a in reversed(actors):
             try: a.destroy()
