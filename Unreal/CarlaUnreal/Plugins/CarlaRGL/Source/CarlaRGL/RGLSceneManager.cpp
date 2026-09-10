@@ -1631,9 +1631,16 @@ bool FRGLSceneManager::SkeletalEnabled() const
     return bApi && CVarRGLSkeletalEnable.GetValueOnGameThread() != 0;
 }
 
+// Identity of a (component, asset) pair for the warn-once and permanent-skip sets.
+// An asset swap changes the key, so the pair is re-evaluated naturally.
+uint64 FRGLSceneManager::SkeletalPairKey(const USkeletalMeshComponent* Comp, const USkeletalMesh* Mesh)
+{
+    return (static_cast<uint64>(PointerHash(Comp)) << 32) ^ static_cast<uint64>(PointerHash(Mesh));
+}
+
 void FRGLSceneManager::WarnSkeletalOnce(const USkeletalMeshComponent* Comp, const USkeletalMesh* Mesh, const FString& Msg)
 {
-    const uint64 Key = (static_cast<uint64>(PointerHash(Comp)) << 32) ^ static_cast<uint64>(PointerHash(Mesh));
+    const uint64 Key = SkeletalPairKey(Comp, Mesh);
     if (SkeletalWarned.Contains(Key)) return;
     SkeletalWarned.Add(Key);
     UE_LOG(LogCarlaRGL, Warning, TEXT("RGLSceneManager[skeletal] %s (%s / %s)"), *Msg, Comp ? *Comp->GetPathName() : TEXT("?"), Mesh ? *Mesh->GetName() : TEXT("?"));
@@ -1650,17 +1657,37 @@ bool FRGLSceneManager::ShouldRegisterSkeletalComponent(USkeletalMeshComponent* C
     if (Comp->bNoSkeletonUpdate) return false;
     const FBoxSphereBounds B = Comp->Bounds;
     if (RegisteredSensors.Num() == 0 || !IsWithinAnySensor(B.Origin, B.SphereRadius, 0.0f)) { bOutOfRange = true; return false; }
+    // Permanently skipped after a non-recoverable extraction/upload failure (spec §6.1);
+    // hard disqualifier, so no hysteresis and no repeated extraction attempts.
+    if (SkeletalSkipped.Contains(SkeletalPairKey(Comp, Comp->GetSkeletalMeshAsset()))) return false;
     if (RGLSkeletal::SelectReadableLOD(Comp->GetSkeletalMeshAsset(), OutReason) < 0) { bRetryLater = true; return false; }
     return true;
 }
 
 rgl_mesh_t FRGLSceneManager::GetOrUploadSkeletalMesh(USkeletalMesh* Mesh, int32& OutLOD, int32& OutRawBoneNum, FString& OutReason)
 {
+    if (!Mesh) { OutReason = TEXT("null skeletal mesh"); return nullptr; }
+    // Resolve the cache key WITHOUT extracting: SelectReadableLOD only inspects buffer
+    // sizes, whereas ExtractSkeletalMesh walks every vertex. N pawns sharing one asset
+    // must therefore cost one extraction, not N (spec §4.2).
+    const int32 LOD = RGLSkeletal::SelectReadableLOD(Mesh, OutReason);
+    if (LOD < 0) return nullptr;   // §3.1 readiness not met: retry later, OutLOD stays < 0
+    // From here on OutLOD >= 0, which tells the caller readiness passed and any later
+    // failure is non-recoverable and must be skipped permanently (spec §6.1).
+    OutLOD = LOD;
+    const FSkeletalMeshKey Key{ Mesh, LOD };
+    if (rgl_mesh_t* Cached = SkeletalMeshCache.Find(Key))
+    {
+        OutRawBoneNum = Mesh->GetRefSkeleton().GetRawBoneNum();
+        return *Cached;
+    }
+
     FRGLSkeletalMeshData Data;
     if (!RGLSkeletal::ExtractSkeletalMesh(Mesh, Data, OutReason)) return nullptr;
-    OutLOD = Data.LODIndex; OutRawBoneNum = Data.RawBoneNum;
-    const FSkeletalMeshKey Key{ Mesh, Data.LODIndex };
-    if (rgl_mesh_t* Cached = SkeletalMeshCache.Find(Key)) return *Cached;
+    // ExtractSkeletalMesh selects the same lowest readable LOD; a divergence would put
+    // the entity on a mesh cached under the wrong key.
+    if (Data.LODIndex != LOD) { OutReason = FString::Printf(TEXT("LOD mismatch: SelectReadableLOD=%d ExtractSkeletalMesh=%d"), LOD, Data.LODIndex); return nullptr; }
+    OutRawBoneNum = Data.RawBoneNum;
     rgl_mesh_t M = nullptr;
     if (rgl_mesh_create(&M, Data.Vertices.GetData(), Data.Vertices.Num(), Data.Indices.GetData(), Data.Indices.Num()) != RGL_SUCCESS || !M) { OutReason = TEXT("rgl_mesh_create failed"); return nullptr; }
     if (rgl_mesh_set_bone_weights(M, Data.Weights.GetData(), Data.Weights.Num()) != RGL_SUCCESS) { RglDestroyChecked(rgl_mesh_destroy(M), TEXT("rgl_mesh_destroy")); OutReason = TEXT("rgl_mesh_set_bone_weights failed"); return nullptr; }
@@ -1702,7 +1729,15 @@ bool FRGLSceneManager::RegisterSkeletalComponent(USkeletalMeshComponent* Comp)
     USkeletalMesh* Mesh = Comp->GetSkeletalMeshAsset();
     FString Reason; int32 LOD = -1, RawBoneNum = 0;
     rgl_mesh_t M = GetOrUploadSkeletalMesh(Mesh, LOD, RawBoneNum, Reason);
-    if (!M) { WarnSkeletalOnce(Comp, Mesh, TEXT("skipped: ") + Reason); return false; }
+    if (!M)
+    {
+        // LOD >= 0 means readiness passed and extraction/upload itself failed: not a
+        // §3.1 condition, so never retry this (component, asset) pair (spec §6.1).
+        // Readiness failures cannot reach here (ShouldRegisterSkeletalComponent returns bRetryLater).
+        if (LOD >= 0) SkeletalSkipped.Add(SkeletalPairKey(Comp, Mesh));
+        WarnSkeletalOnce(Comp, Mesh, TEXT("skipped: ") + Reason);
+        return false;
+    }
     FSkeletalEntityInfo Info;
     Info.Component = Comp; Info.SkeletalMesh = Mesh; Info.LODIndex = LOD; Info.RawBoneNum = RawBoneNum;
     Info.PoseScratch.SetNumUninitialized(RawBoneNum);
@@ -1727,6 +1762,7 @@ void FRGLSceneManager::TeardownSkeletal()
     for (USkeletalMeshComponent* K : Keys) UnregisterSkeletalComponent(K);
     for (auto& P : SkeletalMeshCache) if (P.Value) RglDestroyChecked(rgl_mesh_destroy(P.Value), TEXT("rgl_mesh_destroy"));
     SkeletalMeshCache.Empty(); SkeletalMeshRefCounts.Empty();
+    SkeletalSkipped.Empty(); SkeletalWarned.Empty();
 }
 
 void FRGLSceneManager::UpdateSkeletalPoses()

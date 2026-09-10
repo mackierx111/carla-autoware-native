@@ -167,9 +167,13 @@ private:
     TMap<FSkeletalMeshKey, rgl_mesh_t>                 SkeletalMeshCache;
     TMap<FSkeletalMeshKey, int32>                      SkeletalMeshRefCounts;
     TSet<uint64>                                       SkeletalWarned;
+    /// (component, asset) pairs whose extraction/upload failed for a non-recoverable
+    /// reason (spec §6.1: only §3.1 readiness failures are retried). Permanently skipped.
+    TSet<uint64>                                       SkeletalSkipped;
     bool                                               bSkeletalApiAvailable = false;
 
     static void RglDestroyChecked(rgl_status_t Status, const TCHAR* Api);
+    static uint64 SkeletalPairKey(const USkeletalMeshComponent* Comp, const USkeletalMesh* Mesh);
     bool  SkeletalEnabled() const;
     bool  ShouldRegisterSkeletalComponent(USkeletalMeshComponent* Comp, bool& bOutOfRange, bool& bRetryLater, FString& OutReason) const;
     bool  RegisterSkeletalComponent(USkeletalMeshComponent* Comp);
