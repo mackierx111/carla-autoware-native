@@ -2,7 +2,7 @@
 """Fixed scenario tick-cost driver (skeletal spec §6.2): N walkers + M vehicles, static, one RGL lidar.
 Measures wall time of world.tick() (server frame incl. RGL scene update) after warm-up.
 Usage: python3 measure_skeletal_tick_cost.py --label C [--walkers 7 --vehicles 3 --warmup 100 --frames 600]"""
-import argparse, json, statistics, time
+import argparse, json, statistics, sys, time
 import carla
 
 def main():
@@ -23,12 +23,14 @@ def main():
         actors.append(world.spawn_actor(lidar, carla.Transform(carla.Location(0, 0, 1.65))))
         gp = world.ground_projection(carla.Location(10.0, 0.0, 5.0), 20.0); gz = gp.location.z if gp else 0.0
         walkers = bp.filter("walker.pedestrian.*"); vehicles = bp.filter("vehicle.*")
+        n_walkers = 0; n_vehicles = 0
         for i in range(a.walkers):
-            act = world.spawn_actor(walkers[i % len(walkers)], carla.Transform(carla.Location(10.0 + 2.0 * i, -3.0, gz + 0.2)))
-            if act: actors.append(act)
+            act = world.try_spawn_actor(walkers[i % len(walkers)], carla.Transform(carla.Location(10.0 + 2.0 * i, -3.0, gz + 0.2)))
+            if act: actors.append(act); n_walkers += 1
         for i in range(a.vehicles):
-            act = world.spawn_actor(vehicles[i % len(vehicles)], carla.Transform(carla.Location(12.0 + 6.0 * i, 3.5, gz + 0.3)))
-            if act: actors.append(act)
+            act = world.try_spawn_actor(vehicles[i % len(vehicles)], carla.Transform(carla.Location(12.0 + 6.0 * i, 3.5, gz + 0.3)))
+            if act: actors.append(act); n_vehicles += 1
+        print(f"spawned walkers={n_walkers}/{a.walkers} vehicles={n_vehicles}/{a.vehicles}", file=sys.stderr)
         for _ in range(a.warmup): world.tick()
         dts = []
         for _ in range(a.frames):
