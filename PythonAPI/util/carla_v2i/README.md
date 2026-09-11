@@ -10,6 +10,14 @@ It is a standalone ROS 2 node that lives under `PythonAPI/util/`. It does not ex
 CARLA API, requires no engine changes, and is **read-only towards CARLA**: it never
 modifies world or actor state.
 
+> [!NOTE]
+> This is unrelated to upstream CARLA's **V2X sensor family** (`sensor.other.v2x`,
+> `sensor.other.v2x_custom`, the path-loss model and infrastructure V2I sensors), which
+> models ETSI vehicle-to-vehicle messaging and delivers data through the sensor stream to a
+> Python `listen()` callback. This node instead turns traffic light state into the Autoware
+> signal message and publishes it on ROS 2. The topic name `/v2x/traffic_signals` comes from
+> the Autoware side. Only the word overlaps; the two can coexist.
+
 Verified end to end on the Odaiba map against a pilot-auto.x2 stack: the arbiter's judged
 output carries the published group states, and the ego holds at a red light and departs on
 green.
