@@ -356,6 +356,15 @@ Known limits:
   this change only its door static meshes were). A roof-mounted lidar with a negative
   `lower_fov` therefore returns roof/hood/trunk points at 0-2 m. Filter by range or by the
   ego bounding box downstream if your consumer does not expect them.
+* **Ego self-occlusion costs returns**: those rays used to pass through the unregistered
+  ego body and hit the scene beyond it. They now terminate on the body and come back below
+  the sensor's minimum range, so they are dropped rather than reported. Measured on an
+  empty Odaiba with the j6gen2 ego and its two roof Pandars, the raw cloud shrinks 17.8%
+  (1,186,458 -> 975,408 points over 20 frames) with the skeletal path on. This matches a
+  real vehicle, which does occlude its own lidar, but it is a large enough change that
+  detector behaviour shifts: in that same scene a roadside object 82 m away went from
+  being detected in 2 of 629 frames to 658 of 718, although its own return count was
+  unchanged (about 30 per frame either way).
 * **Kill-switch latency**: `rgl.SkeletalMesh.Enable 0` stops posing immediately, but the
   existing entities are only removed at the next scene sync (<= 1 s).
 
